@@ -1,0 +1,1 @@
+web: gunicorn -w 1 -k gthread --threads 4 --timeout 120 -b 0.0.0.0:$PORT uuf_fixed6:app
