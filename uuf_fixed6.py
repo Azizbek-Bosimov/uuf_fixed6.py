@@ -1800,5 +1800,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8100))
     logger.info(f"Flask {port} portda ishga tushmoqda (lokal rejim)")
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
-```
-
