@@ -30,7 +30,7 @@ logger = logging.getLogger("gold_smc_bot")
 START_TIME = time.time()
 
 # ==================== KONFIGURATSIYA ====================
-SYMBOL = "XAUUSDT"
+SYMBOL = "PAXGUSDT"
 BTC_SYMBOL = "BTCUSDT"
 EUR_SYMBOL = "EURUSDT"
 LIMIT = 200
@@ -352,21 +352,23 @@ def win_rate_text(log):
 
 # ==================== BYBIT API ====================
 def fetch_ohlcv(timeframe, symbol=SYMBOL):
-    interval_map = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
-                    "1h": "60", "4h": "240", "1d": "D"}
+    interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+                    "1h": "1h", "4h": "4h", "1d": "1d"}
     interval = interval_map.get(timeframe, timeframe)
     response = requests.get(
-        "https://api.bybit.com/v5/market/kline",
-        params={"category": "linear", "symbol": symbol, "interval": interval, "limit": LIMIT},
-        headers=HEADERS, timeout=8,
+        "https://api.binance.com/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": LIMIT},
+        headers=HEADERS,
+        timeout=8,
     )
     response.raise_for_status()
-    data = response.json()
-    rows = data.get("result", {}).get("list", [])
+    rows = response.json()
     if not rows:
-        raise RuntimeError(f"Bybit'dan candle ma'lumoti kelmadi: {data}")
-    rows.sort(key=lambda row: int(row[0]))
-    return [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in rows]
+        raise RuntimeError(f"Binance'dan candle ma'lumoti kelmadi: {symbol}")
+    return [
+        [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
+        for r in rows
+    ]
 
 # ==================== SWINGS ====================
 def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
