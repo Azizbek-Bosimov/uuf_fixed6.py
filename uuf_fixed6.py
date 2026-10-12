@@ -1386,17 +1386,15 @@ async def cleanup_tasks(app):
     logger.info("🛑 Bot to'xtatildi.")
 
 # ==================== APP FACTORY ====================
-async def create_app():
+def create_app():
     app = web.Application()
     app.add_routes(routes)
     app.on_startup.append(startup_tasks)
     app.on_cleanup.append(cleanup_tasks)
     return app
 
-# Gunicorn uchun: gunicorn main:app --worker-class aiohttp.GunicornWebWorker --workers 1
 app = create_app()
 
-# ==================== ENTRY (lokal) ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8100))
     logger.info(f"Lokal rejim: http://0.0.0.0:{port}")
