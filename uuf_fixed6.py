@@ -1,23 +1,51 @@
 
 """
-GOLD (XAUUSDT) 5m/15m SMC + ICT Bot - RAILWAY READY (v7)
-To'liq tuzatilgan: thread-safe, gunicorn-compatible, Railway Volume support.
+GOLD (XAUUSDT) 5m/15m SMC + ICT Bot — v11 FINAL
+================================================
+Barcha versiyalar (v7, v8, v9, v10) birlashtirildi.
+Barcha ma'lum muammolar tuzatildi.
+
+Asosiy xususiyatlar:
+  ✅ aiohttp + asyncio (to'liq asinxron)
+  ✅ aiosqlite (non-blocking SQLite state)
+  ✅ Gunicorn-ready (aiohttp.GunicornWebWorker)
+  ✅ Single source of truth: faqat SQLite (JSON fayllar yo'q)
+  ✅ DST-aware session detection (zoneinfo)
+  ✅ Parallel API so'rovlar (asyncio.gather)
+  ✅ Telegram polling + flood control
+  ✅ Webhook bias filtri
+  ✅ News blackout filtri
+  ✅ Killzone filtri
+  ✅ HTF MTF filtri (1h/4h/1d)
+  ✅ Adaptive risk
+  ✅ Trailing SL / BE
+  ✅ Post-trade tracking
+  ✅ Atomic state updates
+  ✅ Graceful shutdown
 """
 
+import asyncio
+import aiohttp
+import aiosqlite
 import datetime
 import html
 import json
 import logging
 import math
 import os
+import secrets
 import sqlite3
-import threading
 import time
 import traceback
 from collections import deque
 
-import requests
-from flask import Flask, request, jsonify
+try:
+    from zoneinfo import ZoneInfo
+    _HAS_ZONEINFO = True
+except ImportError:
+    _HAS_ZONEINFO = False
+
+from aiohttp import web
 
 # ==================== LOGGING ====================
 logging.basicConfig(
@@ -25,39 +53,36 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("gold_smc_bot")
-
-START_TIME = time.time()
+logger = logging.getLogger("gold_smc_bot_v11")
 
 # ==================== KONFIGURATSIYA ====================
-SYMBOL = "PAXGUSDT"
+SYMBOL = "XAUUSDT"
 BTC_SYMBOL = "BTCUSDT"
 EUR_SYMBOL = "EURUSDT"
 LIMIT = 200
+HTF_LIMIT = 100
 RR1, RR2 = 1.5, 3.0
 SWING_LEFT, SWING_RIGHT = 3, 3
-CHECK_INTERVAL_SEC = 1
+CHECK_INTERVAL_SEC = 5
 ZONE_MAX_DISTANCE_PCT = 0.4
 MAX_RISK_PCT = 0.02
 TRADE_STALE_WARNING_HOURS = 6
+FLIP_WARN_INTERVAL_CHECKS = 10
 
-# ✅ FIX: Railway Volume uchun DATA_DIR
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
 try:
     os.makedirs(DATA_DIR, exist_ok=True)
 except Exception:
     DATA_DIR = BASE_DIR
-
-LOG_FILE = os.path.join(DATA_DIR, "trade_log.json")
-STATUS_FILE = os.path.join(DATA_DIR, "status.json")
-DB_FILE = os.path.join(DATA_DIR, "trades.db")
-ACCOUNT_FILE = os.path.join(DATA_DIR, "account.json")
-SUBSCRIBERS_FILE = os.path.join(DATA_DIR, "subscribers.json")
+DB_FILE = os.path.join(DATA_DIR, "gold_bot.sqlite")
 
 DEFAULT_RISK_PER_TRADE_PCT = 1.0
 MAX_RISK_PER_TRADE_PCT = 5.0
-XAUUSD_LOT_UNITS = 100
+
+# MUHIM: Bybit XAUUSDT perpetual uchun 1 lot = 1 troya unsiyasi.
+# Agar boshqa birja ishlatilsa, bu qiymatni tekshiring.
+XAUUSD_LOT_UNITS = 1
 MIN_LOT_STEP = 0.01
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -67,6 +92,11 @@ KILLZONES = [
     {"start": datetime.time(7, 0), "end": datetime.time(11, 0)},
     {"start": datetime.time(12, 0), "end": datetime.time(16, 0)},
 ]
+SESSION_TZ = {
+    "asia": "Asia/Tokyo",
+    "london": "Europe/London",
+    "newyork": "America/New_York",
+}
 
 # ==================== SECRETS ====================
 def _get_secret(name):
@@ -82,191 +112,22 @@ def _get_secret(name):
 BOT_TOKEN = _get_secret("BOT_TOKEN")
 CHAT_ID = _get_secret("CHAT_ID")
 ADMIN_CHAT_ID = str(CHAT_ID)
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change_me_secret")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+WEBHOOK_ENABLED = bool(WEBHOOK_SECRET)
+if not WEBHOOK_ENABLED:
+    logger.warning("⚠️ WEBHOOK_SECRET env da yo'q. Webhook endpoint o'chirilgan.")
+
 PRICE_OFFSET = 0.0
 
-# ==================== ATOMIC WRITE ====================
-def _atomic_write(path, data):
-    tmp_path = f"{path}.tmp"
-    with open(tmp_path, "w", encoding='utf-8') as file:
-        json.dump(data, file, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
-
+# ==================== HELPERS ====================
 def _safe_log_error(error):
-    msg = str(error).replace(BOT_TOKEN, "***").replace(WEBHOOK_SECRET, "***")
+    msg = str(error)
+    if BOT_TOKEN:
+        msg = msg.replace(BOT_TOKEN, "***")
+    if WEBHOOK_SECRET:
+        msg = msg.replace(WEBHOOK_SECRET, "***")
     return msg
 
-# ==================== LOCKS ====================
-state_lock = threading.RLock()
-_news_lock = threading.Lock()
-_log_lock = threading.Lock()
-_htf_lock = threading.Lock()
-_db_lock = threading.Lock()
-_telegram_lock = threading.Lock()
-_zones_cache_lock = threading.Lock()
-
-# ==================== STATE ====================
-SUBSCRIBERS = set()
-ACCOUNT = {"balance": None, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT}
-current_trade = None
-warned_flip = False
-paused = False
-last_impulse_ts = None
-post_trade = None
-
-IMPULSE_LOOKBACK = 20
-IMPULSE_THRESHOLD = 2.5
-POST_TRADE_CHECKS = 20
-POST_TRADE_MIN_CONTINUATION_ATR_MULT = 1.5
-
-PRICE_HISTORY_MAXLEN = 300
-PRICE_HISTORY = deque(maxlen=PRICE_HISTORY_MAXLEN)
-last_impulse_info = None
-
-last_status = {
-    "price": None, "bias5": None, "bias15": None,
-    "bias1h": None, "bias4h": None, "bias1d": None,
-    "checked_at": None,
-}
-
-RSI_PERIOD = 14
-ATR_PERIOD = 14
-VWAP_LOOKBACK = 48
-MIN_CONFIRMATIONS = 2
-ATR_MIN_RISK_MULT = 0.3
-
-HTF_FILTER_ENABLED = True
-STRONG_HTF_FILTER_ENABLED = True
-DAILY_HTF_FILTER_ENABLED = True
-ZONE_MAX_AGE_BARS = 40
-SL_BUFFER_ATR_MULT = 0.15
-
-NEWS_FILTER_ENABLED = True
-NEWS_BLOCK_MINUTES_BEFORE = 30
-NEWS_BLOCK_MINUTES_AFTER = 30
-NEWS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-NEWS_CACHE_TTL_SEC = 3600
-_news_cache = {"events": None, "fetched_at": None}
-
-_htf_cache = {"bias1h": None, "bias4h": None, "bias1d": None, "fetched_at": None}
-HTF_CACHE_TTL_SEC = 60
-
-_zones_cache = {"fvg": None, "ob": None, "last_len": 0}
-
-O, H, L, C = 1, 2, 3, 4
-
-# ==================== METRICS ====================
-_metrics = {
-    "signals_generated": 0,
-    "trades_closed": 0,
-    "wins": 0,
-    "losses": 0,
-    "errors": 0,
-    "start_time": time.time(),
-}
-
-# ==================== DATABASE (SQLite) ====================
-def _init_db():
-    with _db_lock:
-        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                signal TEXT,
-                entry REAL,
-                sl REAL,
-                tp1 REAL,
-                tp2 REAL,
-                result TEXT,
-                close_price REAL,
-                opened_at TEXT,
-                closed_at TEXT,
-                lot REAL,
-                risk_usd REAL,
-                confirmations TEXT
-            )
-        """)
-        conn.commit()
-        return conn
-
-_db_conn = _init_db()
-
-def db_insert_trade(trade, result, close_price, lot=None, risk_usd=None, confirmations=""):
-    with _db_lock:
-        try:
-            _db_conn.execute("""
-                INSERT INTO trades (symbol, signal, entry, sl, tp1, tp2, result,
-                                    close_price, opened_at, closed_at, lot, risk_usd, confirmations)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                SYMBOL, trade["signal"], trade["entry"], trade["sl"],
-                trade["tp1"], trade["tp2"], result, close_price,
-                trade.get("opened_at"), datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                lot, risk_usd, confirmations,
-            ))
-            _db_conn.commit()
-        except Exception as error:
-            logger.error(f"DB insert xato: {_safe_log_error(error)}")
-
-def db_get_recent_trades(limit=50):
-    with _db_lock:
-        try:
-            cursor = _db_conn.execute(
-                "SELECT signal, result, entry, close_price, closed_at FROM trades "
-                "ORDER BY id DESC LIMIT ?", (limit,)
-            )
-            return cursor.fetchall()
-        except Exception as error:
-            logger.error(f"DB select xato: {_safe_log_error(error)}")
-            return []
-
-def db_stats():
-    with _db_lock:
-        try:
-            cursor = _db_conn.execute("""
-                SELECT result, COUNT(*) FROM trades GROUP BY result
-            """)
-            return dict(cursor.fetchall())
-        except Exception:
-            return {}
-
-# ==================== SUBSCRIBERS ====================
-def load_subscribers():
-    if os.path.exists(SUBSCRIBERS_FILE):
-        try:
-            with open(SUBSCRIBERS_FILE, encoding='utf-8') as file:
-                return set(json.load(file))
-        except Exception as error:
-            logger.error(f"Obunachilarni o'qishda xato: {_safe_log_error(error)}")
-    return {ADMIN_CHAT_ID}
-
-def save_subscribers():
-    try:
-        with state_lock:
-            snapshot = sorted(list(SUBSCRIBERS))
-        _atomic_write(SUBSCRIBERS_FILE, snapshot)
-    except Exception as error:
-        logger.error(f"Obunachilarni saqlashda xato: {_safe_log_error(error)}")
-
-# ==================== ACCOUNT ====================
-def load_account():
-    if os.path.exists(ACCOUNT_FILE):
-        try:
-            with open(ACCOUNT_FILE, encoding='utf-8') as file:
-                data = json.load(file)
-                return {
-                    "balance": data.get("balance"),
-                    "risk_pct": data.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT),
-                }
-        except Exception as error:
-            logger.error(f"Hisob ma'lumotini o'qishda xato: {_safe_log_error(error)}")
-    return {"balance": None, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT}
-
-def save_account():
-    _atomic_write(ACCOUNT_FILE, ACCOUNT)
-
-# ==================== HELPERS ====================
 def closed_only(candles):
     return candles[:-1] if len(candles) > 1 else candles
 
@@ -279,207 +140,808 @@ def in_killzone():
             return True
     return False
 
-def detect_impulse(candles, lookback=IMPULSE_LOOKBACK, threshold=IMPULSE_THRESHOLD):
-    if len(candles) < lookback + 1:
-        return None
-    ranges = [c[H] - c[L] for c in candles]
-    avg_range = sum(ranges[-lookback - 1:-1]) / lookback
-    last = candles[-1]
-    last_range = last[H] - last[L]
-    if avg_range == 0:
-        return None
-    ratio = last_range / avg_range
-    if ratio >= threshold:
-        direction = "yuqoriga" if last[C] > last[O] else "pastga"
-        return {
-            "ts": last[0], "ratio": round(ratio, 1), "direction": direction,
-            "range": round(last_range, 2), "price": round(last[C], 2),
-        }
-    return None
-
-# ==================== LOG (JSON) ====================
-_log_cache = {"data": None, "mtime": None}
-
-def load_log():
-    with _log_lock:
-        if not os.path.exists(LOG_FILE):
-            return []
+def current_session():
+    if _HAS_ZONEINFO:
         try:
-            mtime = os.path.getmtime(LOG_FILE)
-            if _log_cache["mtime"] == mtime and _log_cache["data"] is not None:
-                return _log_cache["data"]
-            with open(LOG_FILE, encoding='utf-8') as file:
-                data = json.load(file)
-            _log_cache["data"] = data
-            _log_cache["mtime"] = mtime
-            return data
-        except json.JSONDecodeError:
-            return []
-        except Exception as error:
-            logger.error(f"Log o'qishda xato: {_safe_log_error(error)}")
-            return _log_cache["data"] if _log_cache["data"] is not None else []
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            lon_h = now_utc.astimezone(ZoneInfo(SESSION_TZ["london"])).hour
+            ny_h = now_utc.astimezone(ZoneInfo(SESSION_TZ["newyork"])).hour
+            tok_h = now_utc.astimezone(ZoneInfo(SESSION_TZ["asia"])).hour
+            lon_act = 7 <= lon_h < 16
+            ny_act = 8 <= ny_h < 17
+            tok_act = 9 <= tok_h < 18
+            if lon_act and ny_act:
+                return "london_ny_overlap"
+            if lon_act:
+                return "london"
+            if ny_act:
+                return "newyork"
+            if tok_act:
+                return "asia"
+            return "after_hours"
+        except Exception:
+            pass
+    hour = datetime.datetime.now(datetime.timezone.utc).hour
+    if 0 <= hour < 7:
+        return "asia"
+    if 7 <= hour < 12:
+        return "london"
+    if 12 <= hour < 16:
+        return "london_ny_overlap"
+    if 16 <= hour < 21:
+        return "newyork"
+    return "after_hours"
 
-def save_log(log):
-    with _log_lock:
-        _atomic_write(LOG_FILE, log)
-        _log_cache["data"] = log
-        try:
-            _log_cache["mtime"] = os.path.getmtime(LOG_FILE)
-        except OSError:
-            _log_cache["mtime"] = None
+# ==================== DATABASE (aiosqlite) ====================
+class DatabaseManager:
+    """Non-blocking SQLite state manager. asyncio loop ni bloklamaydi."""
 
-# ==================== STATUS ====================
-def save_status(price, bias5, bias15, bias1h=None, bias4h=None, bias1d=None):
-    with state_lock:
-        trade_snapshot = dict(current_trade) if current_trade else None
-    _atomic_write(STATUS_FILE, {
-        "currentTrade": trade_snapshot,
-        "lastPrice": price,
-        "lastCheckedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "bias5m": bias5, "bias15m": bias15,
-        "bias1h": bias1h, "bias4h": bias4h, "bias1d": bias1d,
-    })
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._conn = None
+        self._lock = asyncio.Lock()
 
-def win_rate_text(log):
-    if not log:
+    async def init(self):
+        self._conn = await aiosqlite.connect(self.db_path)
+        await self._conn.execute("PRAGMA journal_mode=WAL")
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY, value TEXT
+            )
+        """)
+        await self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT, signal TEXT, entry REAL, sl REAL, tp1 REAL, tp2 REAL,
+                result TEXT, close_price REAL, opened_at TEXT, closed_at TEXT,
+                lot REAL, risk_usd REAL, confirmations TEXT
+            )
+        """)
+        await self._conn.commit()
+        logger.info(f"DB tayyor: {self.db_path}")
+
+    async def close(self):
+        if self._conn:
+            await self._conn.close()
+
+    async def state_get(self, key, default=None):
+        async with self._lock:
+            async with self._conn.execute(
+                "SELECT value FROM state WHERE key=?", (key,)
+            ) as cur:
+                row = await cur.fetchone()
+                return json.loads(row[0]) if row else default
+
+    async def state_set(self, key, value):
+        async with self._lock:
+            await self._conn.execute(
+                "INSERT INTO state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, json.dumps(value, ensure_ascii=False)),
+            )
+            await self._conn.commit()
+
+    async def insert_trade(self, trade, result, close_price, lot, risk_usd, confs):
+        async with self._lock:
+            await self._conn.execute("""
+                INSERT INTO trades (symbol, signal, entry, sl, tp1, tp2, result,
+                                    close_price, opened_at, closed_at, lot, risk_usd, confirmations)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                SYMBOL, trade["signal"], trade["entry"], trade["sl"],
+                trade["tp1"], trade["tp2"], result, close_price,
+                trade.get("opened_at"),
+                datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                lot, risk_usd, confs,
+            ))
+            await self._conn.commit()
+
+    async def get_recent_trades(self, limit=50):
+        async with self._lock:
+            async with self._conn.execute(
+                "SELECT signal, result, entry, close_price, closed_at "
+                "FROM trades ORDER BY id DESC LIMIT ?", (limit,)
+            ) as cur:
+                rows = await cur.fetchall()
+                return [
+                    {"signal": r[0], "result": r[1], "entry": r[2],
+                     "close_price": r[3], "closed_at": r[4]}
+                    for r in rows
+                ]
+
+    async def get_all_results(self):
+        async with self._lock:
+            async with self._conn.execute("SELECT result FROM trades") as cur:
+                rows = await cur.fetchall()
+                return [r[0] for r in rows]
+
+db = DatabaseManager(DB_FILE)
+
+# ==================== MEMORY CACHE ====================
+PRICE_HISTORY = deque(maxlen=500)
+_zones_cache = {"fvg": None, "ob": None, "last_ts": 0}
+_swings_cache = {"last_ts": 0, "highs": [], "lows": []}
+_zone_fresh_cache = {}
+_metrics = {
+    "signals": 0, "closed": 0, "wins": 0, "losses": 0,
+    "errors": 0, "tg_errors": 0, "start": time.time(),
+}
+
+O, H, L, C = 1, 2, 3, 4
+
+# ==================== SUBSCRIBERS / ACCOUNT ====================
+async def get_subs():
+    return set(await db.state_get("subscribers", [ADMIN_CHAT_ID]))
+
+async def add_sub(chat_id):
+    s = await get_subs()
+    s.add(chat_id)
+    await db.state_set("subscribers", list(s))
+
+async def remove_sub(chat_id):
+    s = await get_subs()
+    s.discard(chat_id)
+    await db.state_set("subscribers", list(s))
+
+async def get_account():
+    return await db.state_get(
+        "account",
+        {"balance": None, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT},
+    )
+
+async def update_account(balance=None, risk=None):
+    acc = await get_account()
+    if balance is not None:
+        acc["balance"] = balance
+    if risk is not None:
+        acc["risk_pct"] = risk
+    await db.state_set("account", acc)
+
+async def win_rate_text():
+    results = await db.get_all_results()
+    total = len(results)
+    if not total:
         return "Hali statistika yo'q"
-    wins = sum(1 for t in log if t["result"] in ("TP1", "TP2"))
-    breakevens = sum(1 for t in log if "BE" in t["result"] or "Trailing" in t["result"])
-    total = len(log)
-    if total == 0:
-        return "Hali statistika yo'q"
+    wins = sum(1 for r in results if r in ("TP1", "TP2"))
+    breakevens = sum(1 for r in results if "BE" in r or "Trailing" in r)
     return f"{wins / total * 100:.1f}% g'alaba, {breakevens} ta BE/Trailing, jami {total} ta savdo"
 
-# ==================== BYBIT API ====================
-def fetch_ohlcv(timeframe, symbol=SYMBOL):
-    interval_map = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-                    "1h": "1h", "4h": "4h", "1d": "1d"}
-    interval = interval_map.get(timeframe, timeframe)
-    response = requests.get(
-        "https://api.binance.com/api/v3/klines",
-        params={"symbol": symbol, "interval": interval, "limit": LIMIT},
-        headers=HEADERS,
-        timeout=8,
-    )
-    response.raise_for_status()
-    rows = response.json()
-    if not rows:
-        raise RuntimeError(f"Binance'dan candle ma'lumoti kelmadi: {symbol}")
-    return [
-        [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])]
-        for r in rows
-    ]
+# ==================== BYBIT API (async) ====================
+async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
+    imap = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
+            "1h": "60", "4h": "240", "1d": "D"}
+    interval = imap.get(timeframe, timeframe)
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {"category": "linear", "symbol": symbol,
+              "interval": interval, "limit": limit}
+    async with session.get(url, params=params, headers=HEADERS, timeout=10) as r:
+        r.raise_for_status()
+        data = await r.json()
+        rows = data.get("result", {}).get("list", [])
+        if not rows:
+            raise RuntimeError(f"Kline bo'sh: {symbol} {timeframe}")
+        rows.sort(key=lambda x: int(x[0]))
+        return [[int(x[0]), float(x[1]), float(x[2]), float(x[3]),
+                 float(x[4]), float(x[5])] for x in rows]
 
-# ==================== SWINGS ====================
+# ==================== INDICATORS ====================
 def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
     highs, lows = [], []
     n = len(candles)
     if n < left + right + 1:
         return highs, lows
-    for index in range(left, n - right):
-        current_high = candles[index][H]
-        current_low = candles[index][L]
-        is_high = True
-        is_low = True
+    for i in range(left, n - right):
+        ch, cl = candles[i][H], candles[i][L]
+        is_high, is_low = True, True
         for offset in range(-left, right + 1):
             if offset == 0:
                 continue
-            other = candles[index + offset]
-            if other[H] > current_high:
+            other = candles[i + offset]
+            if other[H] > ch:
                 is_high = False
-            if other[L] < current_low:
+            if other[L] < cl:
                 is_low = False
             if not is_high and not is_low:
                 break
         if is_high:
-            highs.append((index, current_high))
+            highs.append((i, ch))
         if is_low:
-            lows.append((index, current_low))
+            lows.append((i, cl))
     return highs, lows
 
-def confirmed_structure_bias(candles, left=SWING_LEFT, right=SWING_RIGHT):
-    highs, lows = find_swings(candles, left, right)
+def get_swings_cached(candles, left=SWING_LEFT, right=SWING_RIGHT):
+    if not candles:
+        return [], []
+    ts = candles[-1][0]
+    if _swings_cache["last_ts"] == ts:
+        return _swings_cache["highs"], _swings_cache["lows"]
+    h, l = find_swings(candles, left, right)
+    _swings_cache.update({"last_ts": ts, "highs": h, "lows": l})
+    return h, l
+
+def confirmed_structure_bias(candles):
+    highs, lows = get_swings_cached(candles)
     if not highs or not lows:
         return None
-    last_high_index, last_high_price = highs[-1]
-    last_low_index, last_low_price = lows[-1]
-    start_index = max(last_high_index, last_low_index) + 1
+    lhi, lhp = highs[-1]
+    lli, llp = lows[-1]
+    start = max(lhi, lli) + 1
     bias = None
-    for index in range(start_index, len(candles)):
-        close = candles[index][C]
-        if close > last_high_price:
+    for i in range(start, len(candles)):
+        c = candles[i][C]
+        if c > lhp:
             bias = "bullish"
-            last_low_price = min(last_low_price, candles[index][L])
-        elif close < last_low_price:
+            llp = min(llp, candles[i][L])
+        elif c < llp:
             bias = "bearish"
-            last_high_price = max(last_high_price, candles[index][H])
+            lhp = max(lhp, candles[i][H])
     return bias
 
-# ==================== LIQUIDITY SWEEP ====================
-def detect_liquidity_sweep(candles, left=SWING_LEFT, right=SWING_RIGHT):
-    highs, lows = find_swings(candles, left, right)
-    if not highs or not lows:
+def detect_impulse(candles, lookback=20, threshold=2.2):
+    if len(candles) < lookback + 1:
         return None
-    last_high_price = highs[-1][1]
-    last_low_price = lows[-1][1]
-    candidates = [candles[-1]]
-    if len(candles) >= 2:
-        candidates.append(candles[-2])
-    for candle in candidates:
-        if candle[H] > last_high_price and candle[C] < last_high_price:
-            return "bearish_sweep"
-        if candle[L] < last_low_price and candle[C] > last_low_price:
-            return "bullish_sweep"
+    ranges = [c[H] - c[L] for c in candles]
+    avg_range = sum(ranges[-lookback - 1:-1]) / lookback
+    if avg_range == 0:
+        return None
+    last = candles[-1]
+    last_range = last[H] - last[L]
+    ratio = last_range / avg_range
+    if ratio >= threshold:
+        return {
+            "ts": last[0],
+            "direction": "yuqoriga" if last[C] > last[O] else "pastga",
+            "range": round(last_range, 2),
+            "ratio": round(ratio, 1),
+            "price": round(last[C], 2),
+        }
     return None
 
-# ==================== FVG + OB ====================
 def detect_fvg(candles):
     fvgs = []
-    for index in range(2, len(candles)):
-        first, third = candles[index - 2], candles[index]
-        if third[L] > first[H]:
+    for i in range(2, len(candles)):
+        f, t = candles[i - 2], candles[i]
+        if t[L] > f[H]:
             fvgs.append({"type": "bullish", "kind": "fvg",
-                         "top": third[L], "bottom": first[H], "index": index})
-        elif third[H] < first[L]:
+                         "top": t[L], "bottom": f[H], "index": i})
+        elif t[H] < f[L]:
             fvgs.append({"type": "bearish", "kind": "fvg",
-                         "top": first[L], "bottom": third[H], "index": index})
+                         "top": f[L], "bottom": t[H], "index": i})
     return fvgs
 
 def detect_order_blocks(candles):
     bodies = [abs(c[C] - c[O]) for c in candles]
-    volumes = [c[5] if len(c) > 5 else 0 for c in candles]
-    order_blocks = []
-    for index in range(10, len(candles) - 1):
-        avg_body = sum(bodies[index - 10:index]) / 10
-        avg_vol = sum(volumes[index - 10:index]) / 10
-        if avg_body == 0 or avg_vol == 0:
+    vols = [c[5] if len(c) > 5 else 0 for c in candles]
+    obs = []
+    for i in range(10, len(candles) - 1):
+        ab = sum(bodies[i - 10:i]) / 10
+        av = sum(vols[i - 10:i]) / 10
+        if ab == 0 or av == 0:
             continue
-        impulsive_body = bodies[index + 1] > avg_body * 1.5
-        impulsive_vol = volumes[index + 1] > avg_vol * 2.0
-        current, following = candles[index], candles[index + 1]
-        bullish_ob = current[C] < current[O] and following[C] > following[O]
-        bearish_ob = current[C] > current[O] and following[C] < following[O]
-        if impulsive_body and impulsive_vol and bullish_ob:
-            order_blocks.append({"type": "bullish", "kind": "ob",
-                                 "top": current[O], "bottom": current[L], "index": index})
-        if impulsive_body and impulsive_vol and bearish_ob:
-            order_blocks.append({"type": "bearish", "kind": "ob",
-                                 "top": current[H], "bottom": current[O], "index": index})
-    return order_blocks
+        ib = bodies[i + 1] > ab * 1.5
+        iv = vols[i + 1] > av * 2.0
+        cur, fol = candles[i], candles[i + 1]
+        bob = cur[C] < cur[O] and fol[C] > fol[O]
+        beob = cur[C] > cur[O] and fol[C] < fol[O]
+        if ib and iv and bob:
+            obs.append({"type": "bullish", "kind": "ob",
+                        "top": cur[O], "bottom": cur[L], "index": i})
+        if ib and iv and beob:
+            obs.append({"type": "bearish", "kind": "ob",
+                        "top": cur[H], "bottom": cur[O], "index": i})
+    return obs
 
 def get_zones_cached(candles):
-    with _zones_cache_lock:
-        if _zones_cache["last_len"] == len(candles) and _zones_cache["fvg"] is not None:
-            return _zones_cache["fvg"] + _zones_cache["ob"]
-        fvg = detect_fvg(candles)
-        ob = detect_order_blocks(candles)
-        _zones_cache["fvg"] = fvg
-        _zones_cache["ob"] = ob
-        _zones_cache["last_len"] = len(candles)
-        return fvg + ob
+    if not candles:
+        return []
+    ts = candles[-1][0]
+    if _zones_cache["last_ts"] == ts and _zones_cache["fvg"] is not None:
+        return _zones_cache["fvg"] + _zones_cache["ob"]
+    fvg = detect_fvg(candles)
+    ob = detect_order_blocks(candles)
+    _zones_cache.update({"fvg": fvg, "ob": ob, "last_ts": ts})
+    return fvg + ob
 
-# ==================== INDIKATORLAR ====================
-def calculate_rsi(candles, period=RSI_PERIOD):
+def _zone_is_fresh(zone, candles, max_age_bars=20):
+    fi = zone["index"]
+    if len(candles) - 1 - fi > max_age_bars:
+        return False
+    key = (fi, candles[-1][0])
+    if key in _zone_fresh_cache:
+        return _zone_fresh_cache[key]
+    res = True
+    for i in range(fi + 1, len(candles)):
+        c = candles[i][C]
+        if zone["type"] == "bullish" and c < zone["bottom"]:
+            res = False
+            break
+        if zone["type"] == "bearish" and c > zone["top"]:
+            res = False
+            break
+    if len(_zone_fresh_cache) > 500:
+        _zone_fresh_cache.clear()
+    _zone_fresh_cache[key] = res
+    return res
+
+def calculate_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        trs.append(max(
+            candles[i][H] - candles[i][L],
+            abs(candles[i][H] - candles[i - 1][C]),
+            abs(candles[i][L] - candles[i - 1][C]),
+        ))
+    return sum(trs[-period:]) / period
+
+def calculate_vwap(candles, lookback=48):
+    cpv, cv = 0, 0
+    for c in candles[-lookback:]:
+        tp = (c[H] + c[L] + c[C]) / 3
+        v = c[5] if len(c) > 5 else 0
+        cpv += tp * v
+        cv += v
+    return cpv / cv if cv > 0 else None
+
+async def adaptive_risk_pct(base_risk):
+    results = await db.get_all_results()
+    total = len(results)
+    if total < 10:
+        return base_risk
+    wins = sum(1 for r in results if r in ("TP1", "TP2"))
+    losses = sum(1 for r in results if r == "SL")
+    denom = wins + losses
+    if denom < 10:
+        return base_risk
+    wr = wins / denom
+    if wr > 0.65:
+        return min(base_risk * 1.5, MAX_RISK_PER_TRADE_PCT)
+    if wr < 0.4:
+        return max(base_risk * 0.5, 0.1)
+    return base_risk
+
+def build_trade(candles, bias, price, atr):
+    all_zones = [
+        z for z in get_zones_cached(candles)
+        if z["type"] == bias and _zone_is_fresh(z, candles)
+    ]
+    if not all_zones:
+        return None
+    all_zones.sort(key=lambda z: abs(price - (z["top"] + z["bottom"]) / 2))
+    zone = all_zones[0]
+    lower = min(zone["bottom"], zone["top"])
+    upper = max(zone["bottom"], zone["top"])
+    tol = price * (ZONE_MAX_DISTANCE_PCT / 100)
+    if not (lower - tol <= price <= upper + tol):
+        return None
+
+    confluence = any(
+        other["kind"] != zone["kind"]
+        and other["bottom"] <= zone["top"]
+        and other["top"] >= zone["bottom"]
+        for other in all_zones
+        if other["index"] != zone["index"] or other["kind"] != zone["kind"]
+    )
+
+    sl_buf = atr * 0.15 if atr else price * 0.001
+    entry = price
+    if bias == "bullish":
+        sl = zone["bottom"] - sl_buf
+        risk = entry - sl
+        if risk <= 0 or risk > entry * MAX_RISK_PCT:
+            return None
+        return {
+            "signal": "LONG", "bias": bias,
+            "entry": round(entry, 2), "sl": round(sl, 2),
+            "tp1": round(entry + risk * RR1, 2),
+            "tp2": round(entry + risk * RR2, 2),
+            "confluence": confluence,
+            "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "breakeven": False, "tp1_notified": False,
+        }
+    else:
+        sl = zone["top"] + sl_buf
+        risk = sl - entry
+        if risk <= 0 or risk > entry * MAX_RISK_PCT:
+            return None
+        return {
+            "signal": "SHORT", "bias": bias,
+            "entry": round(entry, 2), "sl": round(sl, 2),
+            "tp1": round(entry - risk * RR1, 2),
+            "tp2": round(entry - risk * RR2, 2),
+            "confluence": confluence,
+            "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "breakeven": False, "tp1_notified": False,
+        }
+
+def calc_lot(entry, sl, balance, risk_pct):
+    if not balance or balance <= 0:
+        return None
+    r_usd = balance * (risk_pct / 100)
+    p_risk = abs(entry - sl)
+    if p_risk <= 0:
+        return None
+    lot = math.floor((r_usd / (p_risk * XAUUSD_LOT_UNITS)) / MIN_LOT_STEP + 1e-9) * MIN_LOT_STEP
+    return round(max(lot, MIN_LOT_STEP), 2)
+
+# ==================== TELEGRAM ====================
+async def send_telegram(session, text, with_keyboard=False, chat_id=None):
+    targets = [chat_id] if chat_id else list(await get_subs())
+    if not targets:
+        return
+    markup = json.dumps(
+        {"keyboard": [["📊 Signal"]], "resize_keyboard": True}
+    ) if with_keyboard else None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    for target in targets:
+        payload = {"chat_id": target, "text": text}
+        if markup:
+            payload["reply_markup"] = markup
+        for attempt in range(3):
+            try:
+                async with session.post(url, data=payload, timeout=10) as r:
+                    if r.status == 429:
+                        data = await r.json()
+                        retry_after = data.get("parameters", {}).get("retry_after", 1)
+                        logger.warning(f"TG 429: {retry_after}s kutish")
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if r.status == 200:
+                        break
+                    logger.error(f"TG xato {r.status} -> {target}")
+                    _metrics["tg_errors"] += 1
+                    break
+            except Exception as e:
+                logger.error(f"TG exception ({target}): {_safe_log_error(e)}")
+                _metrics["tg_errors"] += 1
+                break
+        await asyncio.sleep(0.05)
+
+# ==================== TRADING LOGIC ====================
+async def close_trade(session, trade, result, price):
+    await db.state_set("current_trade", None)
+    acc = await get_account()
+    adj_risk = await adaptive_risk_pct(acc["risk_pct"])
+    lot = calc_lot(trade["entry"], trade["sl"], acc["balance"], adj_risk) if acc["balance"] else None
+    usd_risk = round(lot * abs(trade["entry"] - trade["sl"]) * XAUUSD_LOT_UNITS, 2) if lot else None
+
+    await db.insert_trade(trade, result, price, lot, usd_risk, trade.get("confirmations", ""))
+    _metrics["closed"] += 1
+    if result in ("TP1", "TP2"):
+        _metrics["wins"] += 1
+    elif result == "SL":
+        _metrics["losses"] += 1
+
+    emoji = {"TP2": "✅", "SL": "❌", "BE": "➖", "MANUAL": "🛑",
+             "BE/Trailing SL": "🛡"}.get(result, "ℹ️")
+    stat = await win_rate_text()
+    await send_telegram(
+        session,
+        f"GOLD {trade['signal']} yopildi {emoji} — {result} (narx {price})\n"
+        f"Statistika: {stat}",
+    )
+
+async def monitor_trade(session, price, bias15):
+    trade = await db.state_get("current_trade")
+    if not trade:
+        return
+
+    side = trade["signal"]
+    entry = trade["entry"]
+    tp1 = trade["tp1"]
+    tp2 = trade["tp2"]
+    notes = []
+    to_close = None
+    sl_changed = False
+
+    tp1_hit = (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
+    if tp1_hit and not trade.get("tp1_notified"):
+        trade["tp1_notified"] = True
+        notes.append(f"🎯 TP1 ga yetdi: {tp1}")
+
+    if side == "LONG" and price >= tp1:
+        new_sl = entry + (price - entry) * 0.5
+        if new_sl > trade["sl"]:
+            trade["sl"] = round(new_sl, 2)
+            trade["breakeven"] = True
+            sl_changed = True
+            notes.append(f"🔥 LONG trailing SL: {trade['sl']}")
+    elif side == "SHORT" and price <= tp1:
+        new_sl = entry - (entry - price) * 0.5
+        if new_sl < trade["sl"]:
+            trade["sl"] = round(new_sl, 2)
+            trade["breakeven"] = True
+            sl_changed = True
+            notes.append(f"🔥 SHORT trailing SL: {trade['sl']}")
+
+    sl_hit = (side == "LONG" and price <= trade["sl"]) or (side == "SHORT" and price >= trade["sl"])
+    tp2_hit = (side == "LONG" and price >= tp2) or (side == "SHORT" and price <= tp2)
+
+    if sl_hit:
+        to_close = ("BE/Trailing SL" if trade.get("breakeven") else "SL", price)
+    elif tp2_hit:
+        to_close = ("TP2", price)
+    elif bias15 is not None and bias15 != trade["bias"]:
+        counter = (await db.state_get("flip_counter", 0)) + 1
+        await db.state_set("flip_counter", counter)
+        if counter >= FLIP_WARN_INTERVAL_CHECKS:
+            notes.append(f"⚠️ {side} ochiq, lekin struktura {bias15} ga o'zgardi.")
+            await db.state_set("flip_counter", 0)
+
+    await db.state_set("current_trade", trade)
+    for n in notes:
+        await send_telegram(session, n)
+    if to_close:
+        await close_trade(session, trade, *to_close)
+        await db.state_set("flip_counter", 0)
+
+# ==================== NEWS ====================
+_news_cache = {"events": None, "fetched_at": None}
+NEWS_CACHE_TTL_SEC = 3600
+NEWS_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+NEWS_BLOCK_MINUTES_BEFORE = 30
+NEWS_BLOCK_MINUTES_AFTER = 30
+
+async def fetch_high_impact_news(session):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cached = _news_cache.get("events")
+    fetched_at = _news_cache.get("fetched_at")
+    if cached is not None and fetched_at and (now - fetched_at).total_seconds() < NEWS_CACHE_TTL_SEC:
+        return cached
+    events = []
+    try:
+        async with session.get(NEWS_CALENDAR_URL, headers=HEADERS, timeout=10) as r:
+            r.raise_for_status()
+            data = await r.json()
+            for item in data:
+                if item.get("country") != "USD" or item.get("impact") != "High":
+                    continue
+                date_str = item.get("date", "")
+                try:
+                    event_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                    if event_time.tzinfo is None:
+                        event_time = event_time.replace(tzinfo=datetime.timezone.utc)
+                except Exception:
+                    continue
+                events.append({"title": item.get("title", "?"), "time": event_time})
+        _news_cache["events"] = events
+        _news_cache["fetched_at"] = now
+        return events
+    except Exception as e:
+        logger.warning(f"News fetch xato: {_safe_log_error(e)}")
+        return cached if cached is not None else []
+
+async def is_news_blackout(session):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for event in await fetch_high_impact_news(session):
+        delta = (event["time"] - now).total_seconds() / 60
+        if -NEWS_BLOCK_MINUTES_AFTER <= delta <= NEWS_BLOCK_MINUTES_BEFORE:
+            return True, event["title"]
+    return False, None
+
+# ==================== HTF ====================
+async def fetch_htf_bias(session):
+    c_time = time.monotonic()
+    cache = await db.state_get("htf_cache", {"b1h": None, "b4h": None, "b1d": None, "ts": 0})
+    if c_time - cache.get("ts", 0) < 60:
+        return cache["b1h"], cache["b4h"], cache["b1d"]
+
+    tasks = [
+        fetch_ohlcv(session, "1h", limit=HTF_LIMIT),
+        fetch_ohlcv(session, "4h", limit=HTF_LIMIT),
+        fetch_ohlcv(session, "1d", limit=HTF_LIMIT),
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    def safe_bias(idx):
+        r = results[idx]
+        if isinstance(r, Exception):
+            logger.debug(f"HTF[{idx}] xato: {_safe_log_error(r)}")
+            return None
+        return confirmed_structure_bias(closed_only(r))
+
+    b1h, b4h, b1d = safe_bias(0), safe_bias(1), safe_bias(2)
+    await db.state_set("htf_cache", {"b1h": b1h, "b4h": b4h, "b1d": b1d, "ts": c_time})
+    return b1h, b4h, b1d
+
+def mtf_alignment_score(b5, b15, b1h, b4h):
+    score = 0
+    if b5 and b15 and b5 == b15:
+        score += 1
+    if b15 and b1h and b15 == b1h:
+        score += 1
+    if b1h and b4h and b1h == b4h:
+        score += 1
+    return score
+
+# ==================== MAIN CYCLE ====================
+async def run_bot_cycle(session):
+    try:
+        c15, c5 = await asyncio.gather(
+            fetch_ohlcv(session, "15m"),
+            fetch_ohlcv(session, "5m"),
+        )
+        b1h, b4h, b1d = await fetch_htf_bias(session)
+
+        cl15 = closed_only(c15)
+        cl5 = closed_only(c5)
+        price = c15[-1][C] + PRICE_OFFSET
+
+        b15 = confirmed_structure_bias(cl15)
+        b5 = confirmed_structure_bias(cl5)
+        PRICE_HISTORY.append(round(price, 2))
+
+        status = {
+            "price": price, "b5": b5, "b15": b15,
+            "b1h": b1h, "b4h": b4h, "b1d": b1d,
+            "time": time.strftime("%H:%M:%S"),
+        }
+        await db.state_set("last_status", status)
+
+        impulse = detect_impulse(cl5)
+        if impulse:
+            last_ts = await db.state_get("last_impulse_ts")
+            if impulse["ts"] != last_ts:
+                await db.state_set("last_impulse_ts", impulse["ts"])
+                await db.state_set("impulse_info", impulse)
+                await send_telegram(
+                    session,
+                    f"⚡ IMPULS (5m): {impulse['direction']} {impulse['range']}$ "
+                    f"({impulse['ratio']}x). Narx: {impulse['price']}.",
+                )
+
+        # Ochiq bitim bo'lsa — monitoring
+        trade = await db.state_get("current_trade")
+        if trade:
+            await monitor_trade(session, price, b15)
+            return
+
+        # Pauza
+        if await db.state_get("paused", False):
+            return
+        if KILLZONES_ENABLED and not in_killzone():
+            return
+
+        blackout, title = await is_news_blackout(session)
+        if blackout:
+            logger.info(f"NONE — Yangilik: {title}")
+            return
+
+        if not b5 or not b15 or b5 != b15:
+            return
+        if b1h and b1h != b15:
+            return
+        if b4h and b4h != b15:
+            return
+        if b1d and b1d != b15:
+            return
+
+        atr15 = calculate_atr(cl15)
+        new_trade = build_trade(cl15, b15, price, atr15)
+        if not new_trade:
+            return
+        if atr15 and abs(new_trade["entry"] - new_trade["sl"]) < atr15:
+            return
+
+        # Confirmations
+        rsis15 = calculate_rsi(cl15)
+        vwap15 = calculate_vwap(cl15)
+        bull_div, bear_div = detect_rsi_divergence(cl15, rsis15)
+        sweep15 = detect_liquidity_sweep(cl15)
+        delta15 = order_flow_delta(cl15)
+        vp15 = volume_profile(cl15)
+        session_name = current_session()
+
+        btc_bias, eur_bias = None, None
+        try:
+            btc_c = await fetch_ohlcv(session, "15m", symbol=BTC_SYMBOL)
+            btc_bias = confirmed_structure_bias(closed_only(btc_c))
+        except Exception as e:
+            logger.warning(f"BTC: {_safe_log_error(e)}")
+        try:
+            eur_c = await fetch_ohlcv(session, "15m", symbol=EUR_SYMBOL)
+            eur_bias = confirmed_structure_bias(closed_only(eur_c))
+        except Exception as e:
+            logger.warning(f"EUR: {_safe_log_error(e)}")
+
+        confirmations = confirmation_check(
+            b15, price, vwap15, bull_div, bear_div,
+            btc_bias, eur_bias, new_trade.get("confluence", False),
+            sweep=sweep15, delta=delta15, vp=vp15, session=session_name,
+        )
+        mtf = mtf_alignment_score(b5, b15, b1h, b4h)
+        if mtf >= 3:
+            confirmations.append(f"MTF: {mtf}/3 (kuchli)")
+        elif mtf == 2:
+            confirmations.append(f"MTF: {mtf}/3")
+
+        if len(confirmations) < 2:
+            return
+
+        acc = await get_account()
+        adj_risk = await adaptive_risk_pct(acc["risk_pct"])
+        lot = calc_lot(new_trade["entry"], new_trade["sl"], acc["balance"], adj_risk) if acc["balance"] else None
+
+        new_trade["confirmations"] = ", ".join(confirmations)
+        msg = (
+            f"GOLD XAUUSDT — {new_trade['signal']}\n"
+            f"5m/15m: {b15} | 1h: {b1h or 'n/a'} | 4h: {b4h or 'n/a'} | 1D: {b1d or 'n/a'}\n"
+            f"MTF: {mtf}/3 | Sessiya: {session_name}\n"
+            f"Narx: {round(price, 2)}\n"
+            f"Entry: {new_trade['entry']} | SL: {new_trade['sl']}\n"
+            f"TP1: {new_trade['tp1']} | TP2: {new_trade['tp2']}\n"
+            f"ATR(15m): {round(atr15, 2) if atr15 else 'n/a'}\n"
+            f"BTC: {btc_bias or 'n/a'} | EUR: {eur_bias or 'n/a'}\n"
+            f"VP: POC={vp15['poc'] if vp15 else 'n/a'} "
+            f"VAH={vp15['vah'] if vp15 else 'n/a'} "
+            f"VAL={vp15['val'] if vp15 else 'n/a'}\n"
+            f"Delta: {delta15}\n"
+            f"Confluence: {'ha' if new_trade.get('confluence') else 'yoq'}\n"
+            f"Tasdiq: {', '.join(confirmations)}\n"
+            f"Lot: {lot or 'Kiritilmagan'}\n"
+            f"Win rate: {await win_rate_text()}"
+        )
+        logger.info(msg.replace("\n", " | "))
+        await db.state_set("current_trade", new_trade)
+        _metrics["signals"] += 1
+        await send_telegram(session, msg)
+
+    except Exception as e:
+        logger.error(f"Cycle xato: {_safe_log_error(e)}")
+        logger.error(traceback.format_exc())
+        _metrics["errors"] += 1
+
+# ==================== CONFIRMATIONS ====================
+def confirmation_check(bias, price, vwap, bull_div, bear_div,
+                       btc_bias=None, eur_bias=None,
+                       zone_confluence=False, sweep=None, delta=None,
+                       vp=None, session=None):
+    confs = []
+    if bias == "bullish":
+        if bull_div:
+            confs.append("RSI divergence (bullish)")
+        if vwap is not None and price > vwap:
+            confs.append("Narx VWAP ustida")
+        if btc_bias == "bullish" and eur_bias == "bullish":
+            confs.append("SMT: BTC + EUR mos")
+        elif btc_bias == "bullish":
+            confs.append("SMT: BTC bullish")
+        elif eur_bias == "bullish":
+            confs.append("SMT: EUR bullish")
+        if sweep == "bullish_sweep":
+            confs.append("Likvidlik yig'ildi (Bullish Sweep)")
+        if delta is not None and delta > 0:
+            confs.append(f"Order Flow delta +{delta}")
+        if vp and price < vp["val"]:
+            confs.append("Narx Value Area pastida")
+    else:
+        if bear_div:
+            confs.append("RSI divergence (bearish)")
+        if vwap is not None and price < vwap:
+            confs.append("Narx VWAP ostida")
+        if btc_bias == "bearish" and eur_bias == "bearish":
+            confs.append("SMT: BTC + EUR mos")
+        elif btc_bias == "bearish":
+            confs.append("SMT: BTC bearish")
+        elif eur_bias == "bearish":
+            confs.append("SMT: EUR bearish")
+        if sweep == "bearish_sweep":
+            confs.append("Likvidlik yig'ildi (Bearish Sweep)")
+        if delta is not None and delta < 0:
+            confs.append(f"Order Flow delta {delta}")
+        if vp and price > vp["vah"]:
+            confs.append("Narx Value Area ustida")
+
+    if session in ("london", "london_ny_overlap", "newyork", "asia"):
+        confs.append(f"Sessiya: {session}")
+    if zone_confluence:
+        confs.append("Zone confluence (FVG + OB)")
+    return confs
+
+# ==================== RSI / DIVERGENCE ====================
+def calculate_rsi(candles, period=14):
     closes = [c[C] for c in candles]
     count = len(closes)
     if count < period + 1:
@@ -502,333 +964,381 @@ def calculate_rsi(candles, period=RSI_PERIOD):
         rsis.append(100 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss)))
     return rsis
 
-def calculate_atr(candles, period=ATR_PERIOD):
-    if len(candles) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(candles)):
-        h, l, pc = candles[i][H], candles[i][L], candles[i - 1][C]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs[-period:]) / period
-
-def calculate_vwap(candles, lookback=VWAP_LOOKBACK):
-    cpv = 0
-    cv = 0
-    for candle in candles[-lookback:]:
-        tp = (candle[H] + candle[L] + candle[C]) / 3
-        vol = candle[5] if len(candle) > 5 else 0
-        cpv += tp * vol
-        cv += vol
-    if cv == 0:
-        return None
-    return cpv / cv
-
 def detect_rsi_divergence(candles, rsis, lookback=20):
-    if len(candles) < lookback or lookback < 5:
+    if len(candles) < lookback or lookback < 7:
         return False, False
     window = candles[-lookback:]
     offset = len(candles) - lookback
     highs, lows = find_swings(window)
-    bullish_div, bearish_div = False, False
+    bull, bear = False, False
     if len(lows) >= 2:
         fi, fp = lows[-2]
         si, sp = lows[-1]
         fr, sr = rsis[offset + fi], rsis[offset + si]
         if fr is not None and sr is not None and sp < fp and sr > fr:
-            bullish_div = True
+            bull = True
     if len(highs) >= 2:
         fi, fp = highs[-2]
         si, sp = highs[-1]
         fr, sr = rsis[offset + fi], rsis[offset + si]
         if fr is not None and sr is not None and sp > fp and sr < fr:
-            bearish_div = True
-    return bullish_div, bearish_div
+            bear = True
+    return bull, bear
+
+# ==================== LIQUIDITY SWEEP ====================
+def detect_liquidity_sweep(candles):
+    highs, lows = get_swings_cached(candles)
+    if not highs or not lows:
+        return None
+    last_high = highs[-1][1]
+    last_low = lows[-1][1]
+    candidates = [candles[-1]]
+    if len(candles) >= 2:
+        candidates.append(candles[-2])
+    for c in candidates:
+        if c[H] > last_high and c[C] < last_high:
+            return "bearish_sweep"
+        if c[L] < last_low and c[C] > last_low:
+            return "bullish_sweep"
+    return None
 
 # ==================== VOLUME PROFILE ====================
 def volume_profile(candles, bins=20, lookback=100):
-    window = candles[-lookback:]
-    if not window:
+    window = candles[-lookback:] if len(candles) >= lookback else candles
+    if len(window) < 2:
         return None
     highs = [c[H] for c in window]
     lows = [c[L] for c in window]
-    price_min, price_max = min(lows), max(highs)
-    if price_max == price_min:
+    pmin, pmax = min(lows), max(highs)
+    if pmax == pmin:
         return None
-    bin_size = (price_max - price_min) / bins
+    bins = min(bins, max(2, len(window) // 2))
+    bsize = (pmax - pmin) / bins
     profile = [0.0] * bins
     for c in window:
-        vol = c[5] if len(c) > 5 else 0
-        idx = int((c[C] - price_min) / bin_size)
+        v = c[5] if len(c) > 5 else 0
+        idx = int((c[C] - pmin) / bsize)
         idx = max(0, min(bins - 1, idx))
-        profile[idx] += vol
+        profile[idx] += v
     poc_idx = profile.index(max(profile))
-    poc = price_min + (poc_idx + 0.5) * bin_size
-    total_vol = sum(profile)
-    target = total_vol * 0.7
-    accumulated = profile[poc_idx]
-    upper = poc_idx
-    lower = poc_idx
-    while accumulated < target and (upper < bins - 1 or lower > 0):
-        up_vol = profile[upper + 1] if upper < bins - 1 else -1
-        dn_vol = profile[lower - 1] if lower > 0 else -1
-        if up_vol >= dn_vol and upper < bins - 1:
-            upper += 1
-            accumulated += profile[upper]
-        elif lower > 0:
-            lower -= 1
-            accumulated += profile[lower]
+    poc = pmin + (poc_idx + 0.5) * bsize
+    total = sum(profile)
+    target = total * 0.7
+    acc = profile[poc_idx]
+    up, dn = poc_idx, poc_idx
+    while acc < target and (up < bins - 1 or dn > 0):
+        upv = profile[up + 1] if up < bins - 1 else -1
+        dnv = profile[dn - 1] if dn > 0 else -1
+        if upv >= dnv and up < bins - 1:
+            up += 1
+            acc += profile[up]
+        elif dn > 0:
+            dn -= 1
+            acc += profile[dn]
         else:
             break
-    vah = price_min + (upper + 1) * bin_size
-    val = price_min + lower * bin_size
+    vah = pmin + (up + 1) * bsize
+    val = pmin + dn * bsize
     return {"poc": round(poc, 2), "vah": round(vah, 2), "val": round(val, 2)}
 
-# ==================== ORDER FLOW ====================
 def order_flow_delta(candles, lookback=20):
-    window = candles[-lookback:]
     delta = 0
-    for c in window:
+    for c in candles[-lookback:]:
         rng = c[H] - c[L]
         if rng == 0:
             continue
-        vol = c[5] if len(c) > 5 else 0
-        delta += ((c[C] - c[O]) / rng) * vol
+        v = c[5] if len(c) > 5 else 0
+        delta += ((c[C] - c[O]) / rng) * v
     return round(delta, 2)
 
-# ==================== SESSION ====================
-def current_session():
-    hour = datetime.datetime.now(datetime.timezone.utc).hour
-    if 0 <= hour < 7:
-        return "asia"
-    if 7 <= hour < 12:
-        return "london"
-    if 12 <= hour < 16:
-        return "london_ny_overlap"
-    if 16 <= hour < 21:
-        return "newyork"
-    return "after_hours"
+# ==================== TELEGRAM LISTENER ====================
+async def telegram_listener(app):
+    session = app["session"]
+    offset = await db.state_get("tg_offset")
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
 
-# ==================== ADAPTIVE RISK ====================
-def adaptive_risk_pct(base_risk):
-    stats = db_stats()
-    wins = stats.get("TP1", 0) + stats.get("TP2", 0)
-    losses = stats.get("SL", 0)
-    total = wins + losses
-    if total < 10:
-        return base_risk
-    win_rate = wins / total
-    if win_rate > 0.65:
-        return min(base_risk * 1.5, MAX_RISK_PER_TRADE_PCT)
-    elif win_rate < 0.4:
-        return max(base_risk * 0.5, 0.1)
-    return base_risk
-
-# ==================== CONFIRMATION ====================
-def confirmation_check(bias, price, vwap, bull_div, bear_div,
-                       btc_bias=None, eur_bias=None,
-                       zone_confluence=False, sweep=None, delta=None,
-                       vp=None, session=None):
-    confirmations = []
-    if bias == "bullish":
-        if bull_div:
-            confirmations.append("RSI divergence (bullish)")
-        if vwap is not None and price > vwap:
-            confirmations.append("Narx VWAP ustida")
-        if btc_bias == "bullish" and eur_bias == "bullish":
-            confirmations.append("SMT: BTC + EUR mos")
-        elif btc_bias == "bullish":
-            confirmations.append("SMT: BTC bullish")
-        elif eur_bias == "bullish":
-            confirmations.append("SMT: EUR bullish")
-        if sweep == "bullish_sweep":
-            confirmations.append("Likvidlik yig'ildi (Bullish Sweep)")
-        if delta is not None and delta > 0:
-            confirmations.append(f"Order Flow delta +{delta}")
-        if vp and price < vp["val"]:
-            confirmations.append("Narx Value Area pastida")
-        if session in ("london", "london_ny_overlap"):
-            confirmations.append(f"Sessiya: {session}")
-    else:
-        if bear_div:
-            confirmations.append("RSI divergence (bearish)")
-        if vwap is not None and price < vwap:
-            confirmations.append("Narx VWAP ostida")
-        if btc_bias == "bearish" and eur_bias == "bearish":
-            confirmations.append("SMT: BTC + EUR mos")
-        elif btc_bias == "bearish":
-            confirmations.append("SMT: BTC bearish")
-        elif eur_bias == "bearish":
-            confirmations.append("SMT: EUR bearish")
-        if sweep == "bearish_sweep":
-            confirmations.append("Likvidlik yig'ildi (Bearish Sweep)")
-        if delta is not None and delta < 0:
-            confirmations.append(f"Order Flow delta {delta}")
-        if vp and price > vp["vah"]:
-            confirmations.append("Narx Value Area ustida")
-        if session in ("london", "london_ny_overlap"):
-            confirmations.append(f"Sessiya: {session}")
-    if zone_confluence:
-        confirmations.append("Zone confluence (FVG + OB)")
-    return confirmations
-
-# ==================== ZONE FRESHNESS ====================
-def _zone_is_fresh(zone, candles, max_age_bars=ZONE_MAX_AGE_BARS):
-    formation_index = zone["index"]
-    last_index = len(candles) - 1
-    if last_index - formation_index > max_age_bars:
-        return False
-    for i in range(formation_index + 1, len(candles)):
-        close = candles[i][C]
-        if zone["type"] == "bullish" and close < zone["bottom"]:
-            return False
-        if zone["type"] == "bearish" and close > zone["top"]:
-            return False
-    return True
-
-# ==================== BUILD TRADE ====================
-def build_trade(candles, bias, price, atr=None):
-    all_zones = [
-        z for z in get_zones_cached(candles)
-        if z["type"] == bias and _zone_is_fresh(z, candles)
-    ]
-    if not all_zones:
-        return None
-    all_zones.sort(key=lambda z: abs(price - (z["top"] + z["bottom"]) / 2))
-    zone = all_zones[0]
-    lower, upper = min(zone["bottom"], zone["top"]), max(zone["bottom"], zone["top"])
-    tolerance = price * (ZONE_MAX_DISTANCE_PCT / 100)
-    if not (lower - tolerance <= price <= upper + tolerance):
-        return None
-
-    confluence = any(
-        (other["index"] != zone["index"] or other["kind"] != zone["kind"])
-        and other["kind"] != zone["kind"]
-        and other["bottom"] <= zone["top"]
-        and other["top"] >= zone["bottom"]
-        for other in all_zones
-    )
-
-    sl_buffer = atr * SL_BUFFER_ATR_MULT if atr else price * 0.001
-    entry = price
-    if bias == "bullish":
-        sl = zone["bottom"] - sl_buffer
-        risk = entry - sl
-        if risk <= 0 or risk > entry * MAX_RISK_PCT:
-            return None
-        tp1, tp2 = entry + risk * RR1, entry + risk * RR2
-        side = "LONG"
-    else:
-        sl = zone["top"] + sl_buffer
-        risk = sl - entry
-        if risk <= 0 or risk > entry * MAX_RISK_PCT:
-            return None
-        tp1, tp2 = entry - risk * RR1, entry - risk * RR2
-        side = "SHORT"
-
-    return {
-        "signal": side, "bias": bias,
-        "entry": round(entry, 2), "sl": round(sl, 2),
-        "tp1": round(tp1, 2), "tp2": round(tp2, 2),
-        "confluence": confluence,
-        "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "breakeven": False, "tp1_notified": False,
-    }
-
-# ==================== POSITION SIZING ====================
-def calculate_position_size(entry, sl, balance, risk_pct):
-    if not balance or balance <= 0:
-        return None
-    price_risk = abs(entry - sl)
-    if price_risk <= 0:
-        return None
-    risk_usd_target = balance * (risk_pct / 100)
-    raw_lot = risk_usd_target / (price_risk * XAUUSD_LOT_UNITS)
-    lot = math.floor(raw_lot / MIN_LOT_STEP + 1e-9) * MIN_LOT_STEP
-    lot = round(lot, 2)
-    undersized = lot < MIN_LOT_STEP
-    if undersized:
-        lot = MIN_LOT_STEP
-    risk_usd_actual = lot * price_risk * XAUUSD_LOT_UNITS
-    risk_pct_actual = (risk_usd_actual / balance) * 100
-    return {
-        "lot": lot, "risk_usd": round(risk_usd_actual, 2),
-        "risk_pct_actual": round(risk_pct_actual, 2),
-        "undersized": undersized,
-    }
-
-# ==================== TELEGRAM ====================
-def send_telegram(text, with_keyboard=False, chat_id=None):
-    with state_lock:
-        targets = [chat_id] if chat_id else list(SUBSCRIBERS)
-    reply_markup = json.dumps({"keyboard": [["📊 Signal"]], "resize_keyboard": True}) if with_keyboard else None
-    for i, target in enumerate(targets):
-        payload = {"chat_id": target, "text": text}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
+    while True:
         try:
-            with _telegram_lock:
-                requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                              data=payload, timeout=10)
+            params = {"timeout": 25}
+            if offset:
+                params["offset"] = offset
+            async with session.get(url, params=params, timeout=30) as r:
+                if r.status != 200:
+                    await asyncio.sleep(5)
+                    continue
+                data = await r.json()
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    await db.state_set("tg_offset", offset)
+                    await _handle_update(app, upd)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.error(f"Telegram xato ({target}): {_safe_log_error(e)}")
-        if i < len(targets) - 1:
-            time.sleep(0.05)
+            logger.error(f"TG poller xato: {_safe_log_error(e)}")
+            await asyncio.sleep(5)
 
-def _trade_age_text(opened_at_iso):
-    if not opened_at_iso:
-        return ""
-    try:
-        opened_at = datetime.datetime.fromisoformat(opened_at_iso)
-        elapsed = datetime.datetime.now(datetime.timezone.utc) - opened_at
-        hours = elapsed.total_seconds() / 3600
-        return f" (ochilganiga {hours:.1f} soat bo'ldi)"
-    except Exception:
-        return ""
+async def _handle_update(app, upd):
+    session = app["session"]
+    msg = upd.get("message", {})
+    text = (msg.get("text") or "").strip()
+    cid = str(msg.get("chat", {}).get("id", ""))
+    if not cid:
+        return
+    is_admin = cid == ADMIN_CHAT_ID
 
-def build_signal_status_text():
-    with state_lock:
-        status_snapshot = dict(last_status)
-        trade_snapshot = dict(current_trade) if current_trade else None
-        is_paused = paused
-    if status_snapshot["price"] is None:
-        return "Bot hali birinchi tekshiruvni bajarmadi, biroz kuting."
+    if text == "/start":
+        was = cid in await get_subs()
+        await add_sub(cid)
+        if not was:
+            await send_telegram(
+                session,
+                "✅ Obuna bo'ldingiz!\n/signal — holat\n/stats — statistika\n"
+                "/stop — bekor",
+                with_keyboard=True, chat_id=cid,
+            )
+        else:
+            await send_telegram(session, await build_status_text(), with_keyboard=True, chat_id=cid)
+    elif text == "/stop":
+        await remove_sub(cid)
+        await send_telegram(session, "🔕 Obuna bekor qilindi.", chat_id=cid)
+    elif text in ("/signal", "📊 Signal"):
+        await send_telegram(session, await build_status_text(), with_keyboard=True, chat_id=cid)
+    elif text == "/stats":
+        await send_telegram(session, f"📊 {await win_rate_text()}", chat_id=cid)
+    elif text == "/pause" and is_admin:
+        await db.state_set("paused", True)
+        await send_telegram(session, "⏸ Pauza.", chat_id=cid)
+    elif text == "/resume" and is_admin:
+        await db.state_set("paused", False)
+        await send_telegram(session, "▶️ Davom.", chat_id=cid)
+    elif text == "/close" and is_admin:
+        t = await db.state_get("current_trade")
+        st = await db.state_get("last_status", {})
+        p = st.get("price")
+        if t and p:
+            await close_trade(session, t, "MANUAL", p)
+            await send_telegram(session, "🛑 Yopildi.", chat_id=cid)
+        else:
+            await send_telegram(session, "Ochiq bitim yo'q.", chat_id=cid)
+    elif text.startswith("/balance") and is_admin:
+        parts = text.split()
+        if len(parts) != 2:
+            await send_telegram(session, "Foydalanish: /balance 500", chat_id=cid)
+            return
+        try:
+            nb = float(parts[1].replace(",", "."))
+            if nb <= 0:
+                raise ValueError
+            await update_account(balance=nb)
+            await send_telegram(session, f"✅ Balans {nb:.2f}$ saqlandi.", chat_id=cid)
+        except ValueError:
+            await send_telegram(session, "Noto'g'ri. /balance 500", chat_id=cid)
+    elif text.startswith("/risk") and is_admin:
+        parts = text.split()
+        if len(parts) != 2:
+            await send_telegram(session, f"/risk 1 (maks {MAX_RISK_PER_TRADE_PCT}%)", chat_id=cid)
+            return
+        try:
+            nr = float(parts[1].replace(",", "."))
+            if not (0 < nr <= MAX_RISK_PER_TRADE_PCT):
+                raise ValueError
+            await update_account(risk=nr)
+            await send_telegram(session, f"✅ Risk {nr}% saqlandi.", chat_id=cid)
+        except ValueError:
+            await send_telegram(session, f"0-{MAX_RISK_PER_TRADE_PCT}% oralig'ida.", chat_id=cid)
+
+async def build_status_text():
+    s = await db.state_get("last_status", {})
+    if not s or s.get("price") is None:
+        return "Bot hali birinchi tekshiruvni bajarmadi."
+    paused = await db.state_get("paused", False)
+    t = await db.state_get("current_trade")
     lines = [
-        f"Holat: {'⏸ PAUZADA' if is_paused else '▶️ Ishlamoqda'}",
-        f"Oxirgi tekshiruv: {status_snapshot['checked_at']}",
-        f"Narx: {round(status_snapshot['price'], 2)}",
-        f"5m: {status_snapshot['bias5'] or 'n/a'} | 15m: {status_snapshot['bias15'] or 'n/a'}",
-        f"1h: {status_snapshot.get('bias1h') or 'n/a'} | 4h: {status_snapshot.get('bias4h') or 'n/a'}",
-        f"1D: {status_snapshot.get('bias1d') or 'n/a'}",
+        f"Holat: {'⏸ PAUZADA' if paused else '▶️ Ishlamoqda'}",
+        f"Oxirgi tekshiruv: {s.get('time')}",
+        f"Narx: {round(s['price'], 2)}",
+        f"5m: {s.get('b5') or 'n/a'} | 15m: {s.get('b15') or 'n/a'}",
+        f"1h: {s.get('b1h') or 'n/a'} | 4h: {s.get('b4h') or 'n/a'} | 1D: {s.get('b1d') or 'n/a'}",
         f"Sessiya: {current_session()}",
     ]
-    if trade_snapshot:
-        age_text = _trade_age_text(trade_snapshot.get("opened_at"))
-        lines.extend([
-            "", f"OCHIQ BITIM: {trade_snapshot['signal']}{age_text}",
-            f"Entry: {trade_snapshot['entry']} | SL: {trade_snapshot['sl']}",
-            f"TP1: {trade_snapshot['tp1']} | TP2: {trade_snapshot['tp2']}",
-        ])
-        with state_lock:
-            balance = ACCOUNT.get("balance")
-            risk_pct = ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
-        if balance:
-            adj_risk = adaptive_risk_pct(risk_pct)
-            sizing = calculate_position_size(trade_snapshot["entry"], trade_snapshot["sl"], balance, adj_risk)
-            if sizing:
-                lines.append(f"Lot: {sizing['lot']} (~{sizing['risk_usd']}$ / {sizing['risk_pct_actual']}%)")
+    if t:
+        lines += [
+            "",
+            f"OCHIQ BITIM: {t['signal']}",
+            f"Entry: {t['entry']} | SL: {t['sl']}",
+            f"TP1: {t['tp1']} | TP2: {t['tp2']}",
+        ]
     else:
-        lines.extend(["", "Ochiq bitim yo'q - signal kutilmoqda."])
-    with state_lock:
-        balance = ACCOUNT.get("balance")
-        risk_pct = ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
-    if balance:
-        lines.append(f"\nHisob: {balance:.2f}$ | Risk: {risk_pct}%")
-    else:
-        lines.append("\n/balance <miqdor> kiriting.")
-    lines.append(f"Statistika: {win_rate_text(load_log())}")
+        lines += ["", "Ochiq bitim yo'q — signal kutilmoqda."]
+    lines.append(f"Statistika: {await win_rate_text()}")
     return "\n".join(lines)
 
-def register_bot_commands():
+# ==================== WEB ROUTES ====================
+routes = web.RouteTableDef()
+
+@routes.get("/")
+async def home(request):
+    s = await db.state_get("last_status", {})
+    t = await db.state_get("current_trade")
+    paused = await db.state_get("paused", False)
+    acc = await get_account()
+    price = s.get("price")
+    price_disp = f"${price:,.2f}" if price else "---"
+
+    trade_html = "Yo'q"
+    if t:
+        trade_html = (
+            f"{t['signal']} | Entry: {t['entry']} | SL: {t['sl']} | "
+            f"TP1: {t['tp1']} | TP2: {t['tp2']}"
+        )
+
+    html_page = f"""<!doctype html>
+<html lang="uz"><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="5">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gold SMC v11</title>
+<style>
+  body {{ background:#14110D; color:#EDE3CF; font-family: monospace; padding:20px; margin:0; }}
+  .card {{ background:#1C1710; border:1px solid #33291C; border-radius:14px;
+           padding:22px; max-width:420px; margin:auto; }}
+  h2 {{ font-size:2em; margin:0 0 8px; }}
+  .tag {{ display:inline-block; padding:4px 10px; border-radius:8px;
+          background:#33291C; margin:4px 4px 4px 0; font-size:0.85em; }}
+  .btn {{ display:block; text-align:center; padding:12px; border-radius:10px;
+          text-decoration:none; margin:14px 0; font-weight:bold; }}
+  .start {{ background:#C9A227; color:#14110D; }}
+  .pause {{ background:#C0553B; color:#fff; }}
+  hr {{ border:none; border-top:1px dashed #33291C; margin:16px 0; }}
+  .muted {{ color:#8C8271; font-size:0.85em; }}
+  .gold {{ color:#E4C047; }}
+</style>
+</head><body>
+  <div class="card">
+    <h2>{price_disp}</h2>
+    <div class="muted">yangilangan: {s.get('time', '---')}</div>
+    <div style="margin-top:10px">
+      <span class="tag">{'⏸ Pauza' if paused else '▶ Ishlamoqda'}</span>
+      <span class="tag">5m: {s.get('b5', '-')}</span>
+      <span class="tag">15m: {s.get('b15', '-')}</span>
+      <span class="tag">1h: {s.get('b1h', '-')}</span>
+      <span class="tag">4h: {s.get('b4h', '-')}</span>
+      <span class="tag">1D: {s.get('b1d', '-')}</span>
+    </div>
+    <a href="{'start_bot' if paused else 'pause_bot'}"
+       class="btn {'start' if paused else 'pause'}">
+       {'▶ Start' if paused else '⏸ Pause'}
+    </a>
+    <hr>
+    <h3>Ochiq bitim</h3>
+    <div>{trade_html}</div>
+    <hr>
+    <div class="muted">Hisob: ${acc.get('balance') or 0} | Risk: {acc.get('risk_pct')}%</div>
+    <div class="gold" style="margin-top:8px">{await win_rate_text()}</div>
+  </div>
+</body></html>"""
+    return web.Response(text=html_page, content_type="text/html")
+
+@routes.get("/start_bot")
+async def start_bot(request):
+    await db.state_set("paused", False)
+    raise web.HTTPFound("/")
+
+@routes.get("/pause_bot")
+async def pause_bot(request):
+    await db.state_set("paused", True)
+    raise web.HTTPFound("/")
+
+@routes.get("/health")
+async def health(request):
+    return web.json_response({
+        "status": "ok",
+        "uptime": round(time.time() - _metrics["start"], 1),
+        "paused": await db.state_get("paused", False),
+        "has_open_trade": bool(await db.state_get("current_trade")),
+        "subscribers": len(await get_subs()),
+        "webhook_enabled": WEBHOOK_ENABLED,
+        "metrics": _metrics,
+    })
+
+@routes.get("/metrics")
+async def metrics(request):
+    lines = [
+        f"signals_total {_metrics['signals']}",
+        f"trades_closed_total {_metrics['closed']}",
+        f"wins_total {_metrics['wins']}",
+        f"losses_total {_metrics['losses']}",
+        f"errors_total {_metrics['errors']}",
+        f"telegram_errors_total {_metrics['tg_errors']}",
+        f"uptime_seconds {round(time.time() - _metrics['start'], 1)}",
+    ]
+    return web.Response(text="\n".join(lines), content_type="text/plain")
+
+@routes.get("/stats")
+async def stats_page(request):
+    recent = await db.get_recent_trades(20)
+    return web.json_response({"recent": recent})
+
+@routes.post("/webhook")
+async def webhook(request):
+    if not WEBHOOK_ENABLED:
+        return web.json_response({"ok": False, "error": "disabled"}, status=403)
+    try:
+        data = await request.json()
+        if data.get("secret") != WEBHOOK_SECRET:
+            return web.json_response({"ok": False, "error": "invalid secret"}, status=403)
+
+        action = data.get("action", "").upper()
+        if action not in ("LONG", "SHORT"):
+            return web.json_response({"ok": False, "error": "invalid action"}, status=400)
+
+        # Bias filtri
+        s = await db.state_get("last_status", {})
+        b15 = s.get("b15")
+        if await db.state_get("paused", False):
+            return web.json_response({"ok": True, "skipped": "paused"})
+        if await db.state_get("current_trade"):
+            return web.json_response({"ok": True, "skipped": "trade_open"})
+
+        expected = "bullish" if action == "LONG" else "bearish"
+        if b15 and b15 != expected:
+            asyncio.create_task(send_telegram(
+                request.app["session"],
+                f"📩 TV signal rad etildi: {action} (bias={b15})",
+            ))
+            return web.json_response({"ok": True, "skipped": "bias_mismatch"})
+
+        asyncio.create_task(send_telegram(
+            request.app["session"],
+            f"📩 TradingView: {action} {data.get('symbol', '?')}\n"
+            f"Narx: {data.get('price', '?')}\n{data.get('message', '')}",
+        ))
+        return web.json_response({"ok": True})
+    except Exception as e:
+        logger.error(f"Webhook xato: {_safe_log_error(e)}")
+        return web.json_response({"ok": False}, status=500)
+
+# ==================== BACKGROUND LOOPS ====================
+async def trading_loop(app):
+    session = app["session"]
+    next_run = time.monotonic()
+    while True:
+        try:
+            await run_bot_cycle(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Trading loop xato: {_safe_log_error(e)}")
+            logger.error(traceback.format_exc())
+            _metrics["errors"] += 1
+        next_run += CHECK_INTERVAL_SEC
+        sleep_time = max(0, next_run - time.monotonic())
+        if sleep_time > CHECK_INTERVAL_SEC * 2:
+            next_run = time.monotonic() + CHECK_INTERVAL_SEC
+            sleep_time = CHECK_INTERVAL_SEC
+        await asyncio.sleep(sleep_time)
+
+async def register_bot_commands(session):
     commands = [
         {"command": "start", "description": "Obuna / holat"},
         {"command": "stop", "description": "Obunani bekor qilish"},
@@ -841,964 +1351,53 @@ def register_bot_commands():
         {"command": "risk", "description": "Risk % (admin)"},
     ]
     try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
-                          json={"commands": commands}, timeout=10)
-        if r.status_code == 200 and r.json().get("ok"):
-            logger.info("Buyruqlar menyusi o'rnatildi.")
+        async with session.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands",
+            json={"commands": commands}, timeout=10,
+        ) as r:
+            if r.status == 200:
+                data = await r.json()
+                if data.get("ok"):
+                    logger.info("Buyruqlar menyusi o'rnatildi.")
     except Exception as e:
-        logger.error(f"Buyruqlar xato: {_safe_log_error(e)}")
+        logger.error(f"setMyCommands xato: {_safe_log_error(e)}")
 
-# ==================== TELEGRAM LISTENER ====================
-def telegram_listener():
-    global paused
-    offset = None
-    backoff = 5
-    max_backoff = 60
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                         params={"timeout": 1}, timeout=10)
-        if r.status_code == 200:
-            results = r.json().get("result", [])
-            if results:
-                offset = results[-1]["update_id"] + 1
-    except Exception as e:
-        logger.error(f"Listener start xato: {_safe_log_error(e)}")
+# ==================== STARTUP / CLEANUP ====================
+async def startup_tasks(app):
+    await db.init()
+    app["session"] = aiohttp.ClientSession()
+    await register_bot_commands(app["session"])
+    app["bot_task"] = asyncio.create_task(trading_loop(app), name="trading_loop")
+    app["tg_task"] = asyncio.create_task(telegram_listener(app), name="tg_listener")
+    logger.info("✅ Bot ishga tushdi (v11 FINAL)")
 
-    while True:
-        try:
-            params = {"timeout": 25}
-            if offset is not None:
-                params["offset"] = offset
-            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                             params=params, timeout=30)
-            if r.status_code != 200:
-                time.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
-                continue
-            backoff = 5
-            for update in r.json().get("result", []):
-                offset = update["update_id"] + 1
-                try:
-                    msg = update.get("message", {})
-                    text = (msg.get("text") or "").strip()
-                    chat_id = str(msg.get("chat", {}).get("id", ""))
-                    if not chat_id:
-                        continue
-                    is_admin = chat_id == ADMIN_CHAT_ID
-
-                    if text == "/start":
-                        with state_lock:
-                            is_new = chat_id not in SUBSCRIBERS
-                            SUBSCRIBERS.add(chat_id)
-                        save_subscribers()
-                        if is_new:
-                            send_telegram(
-                                "✅ Obuna bo'ldingiz!\n"
-                                "/signal - holat\n/stats - statistika\n"
-                                "/balance <miqdor>\n/risk <foiz>\n/stop - bekor",
-                                with_keyboard=True, chat_id=chat_id)
-                        else:
-                            send_telegram(build_signal_status_text(), with_keyboard=True, chat_id=chat_id)
-                    elif text == "/stop":
-                        with state_lock:
-                            was = chat_id in SUBSCRIBERS
-                            SUBSCRIBERS.discard(chat_id)
-                        save_subscribers()
-                        if was:
-                            send_telegram("🔕 Obuna bekor qilindi.", chat_id=chat_id)
-                    elif text in ("/signal", "📊 Signal"):
-                        send_telegram(build_signal_status_text(), with_keyboard=True, chat_id=chat_id)
-                    elif text == "/stats":
-                        stats = db_stats()
-                        log = load_log()
-                        msg_text = (
-                            f"📊 Statistika:\n"
-                            f"Jami savdo: {len(log)}\n"
-                            f"TP1: {stats.get('TP1', 0)}\n"
-                            f"TP2: {stats.get('TP2', 0)}\n"
-                            f"SL: {stats.get('SL', 0)}\n"
-                            f"BE: {stats.get('BE', 0) + stats.get('BE/Trailing SL', 0)}\n"
-                            f"Win rate: {win_rate_text(log)}"
-                        )
-                        send_telegram(msg_text, chat_id=chat_id)
-                    elif text == "/pause":
-                        if not is_admin:
-                            send_telegram("⛔ Faqat admin.", chat_id=chat_id)
-                        else:
-                            with state_lock:
-                                paused = True
-                            send_telegram("⏸ Pauza.")
-                    elif text == "/resume":
-                        if not is_admin:
-                            send_telegram("⛔ Faqat admin.", chat_id=chat_id)
-                        else:
-                            with state_lock:
-                                paused = False
-                            send_telegram("▶️ Davom.")
-                    elif text == "/close":
-                        if not is_admin:
-                            send_telegram("⛔ Faqat admin.", chat_id=chat_id)
-                        else:
-                            with state_lock:
-                                exists = current_trade is not None
-                                price_now = last_status.get("price")
-                            if not exists:
-                                send_telegram("Ochiq bitim yo'q.", chat_id=chat_id)
-                            elif price_now:
-                                close_trade("MANUAL", price_now)
-                                send_telegram("🛑 Yopildi.", chat_id=chat_id)
-                    elif text.startswith("/balance"):
-                        if not is_admin:
-                            send_telegram("⛔ Faqat admin.", chat_id=chat_id)
-                        else:
-                            parts = text.split()
-                            if len(parts) != 2:
-                                send_telegram("Foydalanish: /balance 500", chat_id=chat_id)
-                            else:
-                                try:
-                                    nb = float(parts[1].replace(",", "."))
-                                    if nb <= 0:
-                                        raise ValueError
-                                    with state_lock:
-                                        ACCOUNT["balance"] = nb
-                                    save_account()
-                                    send_telegram(f"✅ Balans {nb:.2f}$ saqlandi.", chat_id=chat_id)
-                                except ValueError:
-                                    send_telegram("Noto'g'ri. /balance 500", chat_id=chat_id)
-                    elif text.startswith("/risk"):
-                        if not is_admin:
-                            send_telegram("⛔ Faqat admin.", chat_id=chat_id)
-                        else:
-                            parts = text.split()
-                            if len(parts) != 2:
-                                send_telegram(f"/risk 1 (maks {MAX_RISK_PER_TRADE_PCT}%)", chat_id=chat_id)
-                            else:
-                                try:
-                                    nr = float(parts[1].replace(",", "."))
-                                    if not (0 < nr <= MAX_RISK_PER_TRADE_PCT):
-                                        raise ValueError
-                                    with state_lock:
-                                        ACCOUNT["risk_pct"] = nr
-                                    save_account()
-                                    send_telegram(f"✅ Risk {nr}% saqlandi.", chat_id=chat_id)
-                                except ValueError:
-                                    send_telegram(f"0-{MAX_RISK_PER_TRADE_PCT}% oralig'ida.", chat_id=chat_id)
-                except Exception as ue:
-                    logger.error(f"Update xato: {_safe_log_error(ue)}")
-        except Exception as e:
-            logger.error(f"Listener xato: {_safe_log_error(e)}, {backoff}s")
-            time.sleep(backoff)
-            backoff = min(backoff * 2, max_backoff)
-
-# ==================== POST TRADE ====================
-def start_post_trade_tracking(side, close_price, atr=None):
-    global post_trade
-    with state_lock:
-        post_trade = {
-            "side": side, "close_price": close_price,
-            "extreme": close_price, "checks": 0, "atr": atr or 5.0,
-        }
-
-def update_post_trade(price):
-    global post_trade
-    with state_lock:
-        if post_trade is None:
-            return
-        if post_trade["side"] == "LONG":
-            post_trade["extreme"] = max(post_trade["extreme"], price)
-        else:
-            post_trade["extreme"] = min(post_trade["extreme"], price)
-        post_trade["checks"] += 1
-        if post_trade["checks"] >= POST_TRADE_CHECKS:
-            moved = abs(post_trade["extreme"] - post_trade["close_price"])
-            threshold = post_trade["atr"] * POST_TRADE_MIN_CONTINUATION_ATR_MULT
-            if moved >= threshold:
-                extreme = post_trade["extreme"]
-                side = post_trade["side"]
-                post_trade = None
-                send_telegram(
-                    f"ℹ️ Oldingi {side} yopilgandan keyin narx {round(moved, 2)}$ "
-                    f"davom etdi (eng yaxshi: {round(extreme, 2)})."
-                )
-            else:
-                post_trade = None
-
-# ==================== CLOSE TRADE ====================
-def close_trade(result, price):
-    global current_trade, warned_flip
-    with state_lock:
-        trade = current_trade
-        if trade is None:
-            return
-        current_trade = None
-        warned_flip = False
-        balance = ACCOUNT.get("balance")
-        risk_pct = ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
-
-    log = load_log()
-    log.append({
-        "id": len(log) + 1, "symbol": SYMBOL,
-        "signal": trade["signal"], "entry": trade["entry"],
-        "result": result, "close_price": price,
-        "closed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    })
-    save_log(log)
-
-    sizing = calculate_position_size(trade["entry"], trade["sl"], balance, risk_pct) if balance else None
-    db_insert_trade(
-        trade, result, price,
-        lot=sizing["lot"] if sizing else None,
-        risk_usd=sizing["risk_usd"] if sizing else None,
-        confirmations=trade.get("confirmations", ""),
-    )
-
-    _metrics["trades_closed"] += 1
-    if result in ("TP1", "TP2"):
-        _metrics["wins"] += 1
-    elif result == "SL":
-        _metrics["losses"] += 1
-
-    emoji = {"TP2": "✅", "SL": "❌", "BE": "➖", "MANUAL": "🛑",
-             "Trailing SL": "🛡", "BE/Trailing SL": "🛡"}.get(result, "ℹ️")
-    send_telegram(
-        f"GOLD {trade['signal']} yopildi {emoji} - {result} (narx {price})\n"
-        f"Statistika: {win_rate_text(log)}"
-    )
-    start_post_trade_tracking(trade["signal"], price)
-    save_status(price, last_status.get("bias5"), last_status.get("bias15"),
-                last_status.get("bias1h"), last_status.get("bias4h"), last_status.get("bias1d"))
-
-# ==================== MONITOR ====================
-def monitor_open_trade(price, bias15):
-    global current_trade, warned_flip
-    notifications = []
-    trade_to_close = None
-    sl_changed = False
-
-    with state_lock:
-        trade = current_trade
-        if trade is None:
-            return
-        side = trade["signal"]
-
-        tp1_hit = price >= trade["tp1"] if side == "LONG" else price <= trade["tp1"]
-        if tp1_hit and not trade.get("tp1_notified"):
-            trade["tp1_notified"] = True
-            notifications.append(f"🎯 TP1 ga yetdi: {trade['tp1']}")
-
-        if side == "LONG":
-            if price >= trade["tp1"]:
-                new_sl = trade["entry"] + (price - trade["entry"]) * 0.5
-                if new_sl > trade["sl"]:
-                    trade["sl"] = round(new_sl, 2)
-                    trade["breakeven"] = True
-                    sl_changed = True
-                    notifications.append(f"🔥 LONG trailing SL: {trade['sl']}")
-        else:
-            if price <= trade["tp1"]:
-                new_sl = trade["entry"] - (trade["entry"] - price) * 0.5
-                if new_sl < trade["sl"]:
-                    trade["sl"] = round(new_sl, 2)
-                    trade["breakeven"] = True
-                    sl_changed = True
-                    notifications.append(f"🔥 SHORT trailing SL: {trade['sl']}")
-
-        sl_hit = price <= trade["sl"] if side == "LONG" else price >= trade["sl"]
-        tp2_hit = price >= trade["tp2"] if side == "LONG" else price <= trade["tp2"]
-
-        if sl_hit:
-            trade_to_close = ("BE/Trailing SL" if trade.get("breakeven") else "SL", price)
-        elif tp2_hit:
-            trade_to_close = ("TP2", price)
-        elif bias15 is not None and bias15 != trade["bias"] and not warned_flip:
-            notifications.append(f"⚠️ {side} ochiq, lekin struktura {bias15}ga o'zgardi.")
-            warned_flip = True
-
-    for note in notifications:
-        send_telegram(note)
-    if trade_to_close:
-        close_trade(*trade_to_close)
-    if sl_changed and not trade_to_close:
-        with state_lock:
-            t = current_trade
+async def cleanup_tasks(app):
+    for key in ("bot_task", "tg_task"):
+        t = app.get(key)
         if t:
-            save_status(last_status.get("price"), last_status.get("bias5"),
-                        last_status.get("bias15"), last_status.get("bias1h"),
-                        last_status.get("bias4h"), last_status.get("bias1d"))
-
-# ==================== NEWS ====================
-def fetch_high_impact_news():
-    now = datetime.datetime.now(datetime.timezone.utc)
-    with _news_lock:
-        cached = _news_cache.get("events")
-        fetched_at = _news_cache.get("fetched_at")
-        if cached is not None and fetched_at is not None and (now - fetched_at).total_seconds() < NEWS_CACHE_TTL_SEC:
-            return cached
-        events = []
-        try:
-            r = requests.get(NEWS_CALENDAR_URL, headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            for item in r.json():
-                if item.get("country") != "USD" or item.get("impact") != "High":
-                    continue
-                date_str = item["date"]
-                try:
-                    event_time = datetime.datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                    if event_time.tzinfo is None:
-                        event_time = event_time.replace(tzinfo=datetime.timezone.utc)
-                except Exception:
-                    continue
-                events.append({"title": item.get("title", "?"), "time": event_time})
-            _news_cache["events"] = events
-            _news_cache["fetched_at"] = now
-            return events
-        except Exception as e:
-            logger.warning(f"Yangiliklar olinmadi: {_safe_log_error(e)}")
-            return cached if cached is not None else []
-
-def is_news_blackout():
-    if not NEWS_FILTER_ENABLED:
-        return False, None
-    now = datetime.datetime.now(datetime.timezone.utc)
-    for event in fetch_high_impact_news():
-        delta = (event["time"] - now).total_seconds() / 60
-        if -NEWS_BLOCK_MINUTES_AFTER <= delta <= NEWS_BLOCK_MINUTES_BEFORE:
-            return True, event["title"]
-    return False, None
-
-# ==================== HTF BIAS ====================
-def _fetch_htf_bias():
-    now = time.monotonic()
-    with _htf_lock:
-        if _htf_cache["fetched_at"] is not None and (now - _htf_cache["fetched_at"]) < HTF_CACHE_TTL_SEC:
-            return _htf_cache["bias1h"], _htf_cache["bias4h"], _htf_cache["bias1d"]
-    b1h, b4h, b1d = None, None, None
-    try:
-        b1h = confirmed_structure_bias(closed_only(fetch_ohlcv("1h")))
-    except Exception as e:
-        logger.debug(f"1h: {_safe_log_error(e)}")
-    try:
-        b4h = confirmed_structure_bias(closed_only(fetch_ohlcv("4h")))
-    except Exception as e:
-        logger.debug(f"4h: {_safe_log_error(e)}")
-    try:
-        b1d = confirmed_structure_bias(closed_only(fetch_ohlcv("1d")))
-    except Exception as e:
-        logger.debug(f"1d: {_safe_log_error(e)}")
-    with _htf_lock:
-        _htf_cache["bias1h"] = b1h
-        _htf_cache["bias4h"] = b4h
-        _htf_cache["bias1d"] = b1d
-        _htf_cache["fetched_at"] = time.monotonic()
-    return b1h, b4h, b1d
-
-# ==================== MTF CONFLUENCE ====================
-def mtf_confluence_score(b5, b15, b1h, b4h):
-    score = 0
-    if b5 and b15 and b5 == b15:
-        score += 1
-    if b15 and b1h and b15 == b1h:
-        score += 1
-    if b1h and b4h and b1h == b4h:
-        score += 1
-    return score
-
-# ==================== MAIN RUN ====================
-def run():
-    global current_trade, last_impulse_ts, last_impulse_info
-
-    try:
-        candles15_raw = fetch_ohlcv("15m")
-        candles5_raw = fetch_ohlcv("5m")
-    except Exception as e:
-        logger.error(f"Candle yuklashda xato: {_safe_log_error(e)}")
-        _metrics["errors"] += 1
-        return
-
-    closed15 = closed_only(candles15_raw)
-    closed5 = closed_only(candles5_raw)
-    price = candles15_raw[-1][C] + PRICE_OFFSET
-
-    bias15 = confirmed_structure_bias(closed15)
-    bias5 = confirmed_structure_bias(closed5)
-    atr15 = calculate_atr(closed15)
-    bias1h, bias4h, bias1d = _fetch_htf_bias()
-
-    with state_lock:
-        last_status.update({
-            "price": price, "bias5": bias5, "bias15": bias15,
-            "bias1h": bias1h, "bias4h": bias4h, "bias1d": bias1d,
-            "checked_at": time.strftime("%H:%M:%S"),
-        })
-        PRICE_HISTORY.append(round(price, 2))
-
-    save_status(round(price, 2), bias5, bias15, bias1h, bias4h, bias1d)
-
-    impulse = detect_impulse(closed5)
-    if impulse and impulse["ts"] != last_impulse_ts:
-        last_impulse_ts = impulse["ts"]
-        with state_lock:
-            last_impulse_info = dict(impulse)
-            last_impulse_info["detected_at"] = time.strftime("%H:%M:%S")
-        send_telegram(
-            f"⚡ IMPULS (5m): {impulse['direction']} {impulse['range']}$ "
-            f"({impulse['ratio']}x). Narx: {impulse['price']}."
-        )
-
-    with state_lock:
-        has_open_trade = current_trade is not None
-        is_paused = paused
-
-    if has_open_trade:
-        monitor_open_trade(price, bias15)
-        return
-
-    update_post_trade(price)
-
-    if is_paused:
-        logger.info("NONE - Pauzada")
-        return
-
-    if KILLZONES_ENABLED and not in_killzone():
-        logger.info("NONE - Killzone tashqarisi")
-        return
-
-    blackout, event_title = is_news_blackout()
-    if blackout:
-        logger.info(f"NONE - Yangilik: {event_title}")
-        return
-
-    if bias5 is None or bias15 is None or bias5 != bias15:
-        logger.info(f"NONE - 5m={bias5}, 15m={bias15}")
-        return
-
-    if HTF_FILTER_ENABLED and bias1h is not None and bias1h != bias15:
-        logger.info(f"NONE - 1h qarshi")
-        return
-
-    if STRONG_HTF_FILTER_ENABLED and bias4h is not None and bias4h != bias15:
-        logger.info(f"NONE - 4h qarshi")
-        return
-
-    if DAILY_HTF_FILTER_ENABLED and bias1d is not None and bias1d != bias15:
-        logger.info(f"NONE - 1D qarshi")
-        return
-
-    trade = build_trade(closed15, bias15, price, atr15)
-    if trade is None:
-        logger.info("NONE - Zona topilmadi")
-        return
-
-    risk = abs(trade["entry"] - trade["sl"])
-    if atr15 and risk < atr15 * ATR_MIN_RISK_MULT:
-        logger.info(f"NONE - SL juda tor")
-        return
-
-    rsis15 = calculate_rsi(closed15)
-    vwap15 = calculate_vwap(closed15)
-    bull_div, bear_div = detect_rsi_divergence(closed15, rsis15)
-    sweep15 = detect_liquidity_sweep(closed15)
-    delta15 = order_flow_delta(closed15)
-    vp15 = volume_profile(closed15)
-    session = current_session()
-    mtf_score = mtf_confluence_score(bias5, bias15, bias1h, bias4h)
-
-    btc_bias15, eur_bias15 = None, None
-    try:
-        btc_bias15 = confirmed_structure_bias(closed_only(fetch_ohlcv("15m", symbol=BTC_SYMBOL)))
-    except Exception as e:
-        logger.warning(f"BTC: {_safe_log_error(e)}")
-    try:
-        eur_bias15 = confirmed_structure_bias(closed_only(fetch_ohlcv("15m", symbol=EUR_SYMBOL)))
-    except Exception as e:
-        logger.warning(f"EUR: {_safe_log_error(e)}")
-
-    confirmations = confirmation_check(
-        bias15, price, vwap15, bull_div, bear_div,
-        btc_bias15, eur_bias15, trade.get("confluence", False),
-        sweep=sweep15, delta=delta15, vp=vp15, session=session,
-    )
-
-    if mtf_score >= 3:
-        confirmations.append(f"MTF confluence: {mtf_score}/3 (kuchli)")
-    elif mtf_score == 2:
-        confirmations.append(f"MTF confluence: {mtf_score}/3")
-
-    if len(confirmations) < MIN_CONFIRMATIONS:
-        logger.info(f"NONE - Tasdiq kam ({len(confirmations)}/{MIN_CONFIRMATIONS})")
-        return
-
-    with state_lock:
-        balance = ACCOUNT.get("balance")
-        base_risk = ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
-    adj_risk = adaptive_risk_pct(base_risk)
-
-    if balance:
-        sizing = calculate_position_size(trade["entry"], trade["sl"], balance, adj_risk)
-        if sizing is None:
-            position_line = "\nLot: hisoblab bo'lmadi."
-        elif sizing["undersized"]:
-            position_line = f"\n⚠️ Lot: {sizing['lot']} (min) - ~{sizing['risk_pct_actual']}%"
-        else:
-            position_line = f"\nLot: {sizing['lot']} (~{sizing['risk_usd']}$ / {sizing['risk_pct_actual']}%)"
-    else:
-        position_line = "\n/balance <miqdor> kiriting."
-
-    trade["confirmations"] = ", ".join(confirmations)
-    confluence_text = "ha" if trade.get("confluence") else "yoq"
-    message = (
-        f"GOLD XAUUSDT - {trade['signal']}\n"
-        f"5m/15m: {bias15} | 1h: {bias1h or 'n/a'} | 4h: {bias4h or 'n/a'} | 1D: {bias1d or 'n/a'}\n"
-        f"MTF: {mtf_score}/3 | Sessiya: {session}\n"
-        f"Narx: {round(price, 2)}\n"
-        f"Entry: {trade['entry']} | SL: {trade['sl']}\n"
-        f"TP1: {trade['tp1']} | TP2: {trade['tp2']}\n"
-        f"ATR(15m): {round(atr15, 2) if atr15 else 'n/a'}\n"
-        f"BTC: {btc_bias15 or 'n/a'} | EUR: {eur_bias15 or 'n/a'}\n"
-        f"VP: POC={vp15['poc'] if vp15 else 'n/a'} VAH={vp15['vah'] if vp15 else 'n/a'} VAL={vp15['val'] if vp15 else 'n/a'}\n"
-        f"Delta: {delta15}\n"
-        f"Confluence: {confluence_text}\n"
-        f"Tasdiq: {', '.join(confirmations)}"
-        f"{position_line}\n"
-        f"Win rate: {win_rate_text(load_log())}"
-    )
-    logger.info(message.replace("\n", " | "))
-    send_telegram(message)
-
-    with state_lock:
-        current_trade = trade
-    _metrics["signals_generated"] += 1
-    save_status(round(price, 2), bias5, bias15, bias1h, bias4h, bias1d)
-
-# ==================== FLASK ====================
-app = Flask(__name__)
-BIAS_LABELS_UZ = {"bullish": "ko'tarilish", "bearish": "pasayish"}
-
-def _bias_label(bias):
-    return BIAS_LABELS_UZ.get(bias, "aniqlanmagan")
-
-def _bias_dot_color(bias):
-    if bias == "bullish":
-        return "#5B9C6D"
-    if bias == "bearish":
-        return "#C0553B"
-    return "#5B5445"
-
-def _render_bias_chip(tf_label, bias):
-    color = _bias_dot_color(bias)
-    text = _bias_label(bias)
-    return (
-        f'<div class="chip"><span class="chip-dot" style="background:{color}"></span>'
-        f'<span class="chip-tf">{html.escape(tf_label)}</span>'
-        f'<span class="chip-val">{html.escape(text)}</span></div>'
-    )
-
-def _build_sparkline(prices, width=272, height=54, color="#C9A227"):
-    if not prices or len(prices) < 2:
-        return '<div class="spark-empty">narx tarixi to\'planmoqda&hellip;</div>'
-    min_p, max_p = min(prices), max(prices)
-    span = max_p - min_p
-    if span == 0:
-        span = max(abs(min_p) * 0.001, 1)
-    step = width / (len(prices) - 1)
-    pts = []
-    for i, price in enumerate(prices):
-        x = i * step
-        y = height - ((price - min_p) / span) * (height - 8) - 4
-        pts.append((x, y))
-    polyline = " ".join(f"{x:.1f},{y:.1f}" for x, y in pts)
-    last_x, last_y = pts[-1]
-    fill_path = f"M0,{height} L" + " L".join(f"{x:.1f},{y:.1f}" for x, y in pts) + f" L{width},{height} Z"
-    return f"""
-    <svg viewBox="0 0 {width} {height}" width="100%" height="{height}" preserveAspectRatio="none" class="spark">
-      <path d="{fill_path}" fill="url(#sparkfade)" stroke="none"/>
-      <polyline points="{polyline}" fill="none" stroke="{color}" stroke-width="1.6"
-        stroke-linecap="round" stroke-linejoin="round"/>
-      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="2.6" fill="{color}"/>
-      <defs>
-        <linearGradient id="sparkfade" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="{color}" stop-opacity="0.28"/>
-          <stop offset="100%" stop-color="{color}" stop-opacity="0"/>
-        </linearGradient>
-      </defs>
-    </svg>
-    """
-
-def _render_recent_trades(log, limit=5):
-    if not log:
-        return '<div class="muted-line">Hali yopilgan savdo yo\'q.</div>'
-    icons = {"TP1": "✓", "TP2": "✓", "SL": "✗", "BE": "•", "MANUAL": "•", "BE/Trailing SL": "🛡"}
-    colors = {"TP1": "#5B9C6D", "TP2": "#5B9C6D", "SL": "#C0553B", "BE": "#8C8271",
-              "MANUAL": "#8C8271", "BE/Trailing SL": "#5B9C6D"}
-    rows = []
-    for entry in reversed(log[-limit:]):
-        result = entry.get("result", "?")
-        closed_at = (entry.get("closed_at") or "")[11:16]
-        rows.append(
-            f'<div class="trade-row">'
-            f'<span class="trade-icon" style="color:{colors.get(result, "#8C8271")}">{icons.get(result, "•")}</span>'
-            f'<span class="trade-side">{html.escape(str(entry.get("signal", "?")))}</span>'
-            f'<span class="trade-result" style="color:{colors.get(result, "#8C8271")}">{html.escape(result)}</span>'
-            f'<span class="trade-time">{html.escape(closed_at)}</span></div>'
-        )
-    return "".join(rows)
-
-# ==================== ROUTES ====================
-@app.route("/start_bot")
-def start_bot():
-    global paused
-    with state_lock:
-        paused = False
-    return home()
-
-@app.route("/pause_bot")
-def pause_bot():
-    global paused
-    with state_lock:
-        paused = True
-    return home()
-
-@app.route("/health")
-def health():
-    with state_lock:
-        uptime = time.time() - _metrics["start_time"]
-        has_trade = current_trade is not None
-        subs_count = len(SUBSCRIBERS)
-    return jsonify({
-        "status": "ok",
-        "uptime_sec": round(uptime, 1),
-        "paused": paused,
-        "has_open_trade": has_trade,
-        "subscribers": subs_count,
-        "metrics": _metrics,
-    })
-
-@app.route("/metrics")
-def metrics():
-    lines = [
-        f"signals_total {_metrics['signals_generated']}",
-        f"trades_closed_total {_metrics['trades_closed']}",
-        f"wins_total {_metrics['wins']}",
-        f"losses_total {_metrics['losses']}",
-        f"errors_total {_metrics['errors']}",
-        f"uptime_seconds {round(time.time() - _metrics['start_time'], 1)}",
-    ]
-    return "\n".join(lines), 200, {"Content-Type": "text/plain"}
-
-@app.route("/stats")
-def stats_page():
-    return jsonify({"db_stats": db_stats(), "recent": db_get_recent_trades(20)})
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        if data.get("secret") != WEBHOOK_SECRET:
-            return jsonify({"ok": False, "error": "invalid secret"}), 403
-        action = data.get("action", "").upper()
-        if action in ("LONG", "SHORT"):
-            send_telegram(
-                f"📩 TradingView signal: {action} {data.get('symbol', '?')}\n"
-                f"Narx: {data.get('price', '?')}\n"
-                f"Xabar: {data.get('message', '')}"
-            )
-        return jsonify({"ok": True})
-    except Exception as e:
-        logger.error(f"Webhook xato: {_safe_log_error(e)}")
-        return jsonify({"ok": False}), 500
-
-@app.route("/")
-def home():
-    with state_lock:
-        trade = dict(current_trade) if current_trade else None
-        status_snapshot = dict(last_status)
-        is_paused = paused
-        price_history = list(PRICE_HISTORY)
-        impulse_snapshot = dict(last_impulse_info) if last_impulse_info else None
-        balance = ACCOUNT.get("balance")
-        risk_pct = ACCOUNT.get("risk_pct", DEFAULT_RISK_PER_TRADE_PCT)
-
-    price_value = status_snapshot["price"]
-    price_display = f"${price_value:,.2f}" if price_value is not None else "&mdash;"
-    time_display = status_snapshot["checked_at"] or "hali yangilanmadi"
-    killzone_now = in_killzone()
-    blackout_now, blackout_title = is_news_blackout()
-    session = current_session()
-    mtf_score = mtf_confluence_score(
-        status_snapshot.get("bias5"), status_snapshot.get("bias15"),
-        status_snapshot.get("bias1h"), status_snapshot.get("bias4h"),
-    )
-
-    if is_paused:
-        control_button = '<a href="/start_bot" class="ctrl-btn ctrl-start"><span class="ctrl-icon"></span>start</a>'
-    else:
-        control_button = '<a href="/pause_bot" class="ctrl-btn ctrl-pause"><span class="ctrl-icon"></span>pause</a>'
-
-    status_chips = "".join([
-        f'<span class="tag">{"⏸ pauzada" if is_paused else "▶ ishlamoqda"}</span>',
-        f'<span class="tag">{"🟢 killzone" if killzone_now else "⚪ tashqarida"}</span>',
-        f'<span class="tag">🌐 {html.escape(session)}</span>',
-        f'<span class="tag">📊 MTF {mtf_score}/3</span>',
-        f'<span class="tag tag-warn">📰 {html.escape(blackout_title or "")}</span>' if blackout_now else "",
-    ])
-
-    bias_grid = "".join([
-        _render_bias_chip("5m", status_snapshot.get("bias5")),
-        _render_bias_chip("15m", status_snapshot.get("bias15")),
-        _render_bias_chip("1h", status_snapshot.get("bias1h")),
-        _render_bias_chip("4h", status_snapshot.get("bias4h")),
-        _render_bias_chip("1D", status_snapshot.get("bias1d")),
-    ])
-
-    if trade:
-        side_color = "#5B9C6D" if trade["signal"] == "LONG" else "#C0553B"
-        trade_block = f"""
-        <div class="trade-open">
-          <span class="side-tag" style="background:{side_color}">{html.escape(trade['signal'])}</span>
-          <div class="trade-grid">
-            <div><span class="k">entry</span><span class="v">{trade['entry']}</span></div>
-            <div><span class="k">sl</span><span class="v">{trade['sl']}</span></div>
-            <div><span class="k">tp1</span><span class="v">{trade['tp1']}</span></div>
-            <div><span class="k">tp2</span><span class="v">{trade['tp2']}</span></div>
-          </div>
-        </div>
-        """
-    else:
-        trade_block = '<div class="muted-line italic">Hozircha ochiq savdo yo\'q.</div>'
-
-    impulse_block = ""
-    if impulse_snapshot:
-        impulse_block = f"""
-        <div class="section">
-          <div class="section-title">So'nggi impuls</div>
-          <div class="muted-line">
-            {html.escape(impulse_snapshot['direction'])} {impulse_snapshot['range']}$
-            &middot; {impulse_snapshot['ratio']}x &middot; {html.escape(impulse_snapshot['detected_at'])}
-          </div>
-        </div>
-        """
-
-    log = load_log()
-    wins = sum(1 for e in log if e.get("result") in ("TP1", "TP2"))
-    total = len(log)
-    win_pct = f"{wins / total * 100:.0f}%" if total else "&mdash;"
-
-    balance_line = f"${balance:,.2f} | risk {risk_pct}%" if balance else "/balance kiriting"
-
-    return f"""<!doctype html>
-    <html lang="uz"><head>
-    <meta charset="utf-8">
-    <meta http-equiv="refresh" content="5">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Gold Ticket &middot; XAUUSDT</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-      :root {{
-        --bg:#14110D; --surface:#1C1710; --border:#33291C; --text:#EDE3CF;
-        --muted:#8C8271; --gold:#C9A227; --gold-bright:#E4C047;
-        --green:#5B9C6D; --red:#C0553B;
-      }}
-      * {{ box-sizing:border-box; }}
-      body {{
-        background:var(--bg); color:var(--text); margin:0; padding:32px 16px;
-        font-family:'IBM Plex Mono', monospace;
-        display:flex; justify-content:center;
-      }}
-      .ticket {{
-        width:100%; max-width:400px; background:var(--surface);
-        border:1px solid var(--border); border-radius:18px;
-        padding:28px 26px 22px; position:relative; overflow:hidden;
-        box-shadow:0 20px 50px rgba(0,0,0,0.45);
-      }}
-      .ticket::before {{
-        content:""; position:absolute; top:0; left:0; right:0; height:10px;
-        background:radial-gradient(circle at 10px 0, transparent 6px, var(--bg) 6.5px) repeat-x;
-        background-size:20px 20px; background-position:-4px -5px;
-      }}
-      .eyebrow {{ font-size:0.78em; color:var(--muted); letter-spacing:0.02em; margin:6px 0 2px; }}
-      .hero-price {{
-        font-family:'Fraunces', serif; font-weight:600; font-size:2.7em;
-        color:var(--text); line-height:1.1; margin:0;
-      }}
-      .hero-sub {{ color:var(--muted); font-size:0.82em; margin:4px 0 14px; }}
-      .spark {{ display:block; margin:0 0 18px; }}
-      .spark-empty {{ color:var(--muted); font-size:0.8em; margin:8px 0 18px; }}
-      .tags {{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:16px; }}
-      .tag {{
-        font-size:0.72em; color:var(--muted); border:1px solid var(--border);
-        border-radius:999px; padding:4px 10px;
-      }}
-      .tag-warn {{ color:var(--gold-bright); border-color:var(--gold); }}
-      .ctrl-btn {{
-        display:flex; align-items:center; justify-content:center; gap:10px; width:100%;
-        padding:13px 20px; border-radius:12px; margin-bottom:20px;
-        font-family:'IBM Plex Mono', monospace; font-weight:600; font-size:1em;
-        text-decoration:none; color:#14110D; border:none;
-      }}
-      .ctrl-icon {{ width:16px; height:16px; background:#14110D; border-radius:4px; display:inline-block; }}
-      .ctrl-start {{ background:linear-gradient(180deg, var(--gold-bright), var(--gold)); }}
-      .ctrl-pause {{ background:linear-gradient(180deg, #d98a76, var(--red)); color:#1a0e0a; }}
-      .ctrl-pause .ctrl-icon {{ background:#1a0e0a; }}
-      .section {{ margin:18px 0; }}
-      .section-title {{ font-size:0.78em; color:var(--muted); margin-bottom:8px; }}
-      .chips {{ display:flex; flex-wrap:wrap; gap:8px; }}
-      .chip {{
-        display:flex; align-items:center; gap:6px; font-size:0.78em;
-        border:1px solid var(--border); border-radius:8px; padding:6px 9px;
-      }}
-      .chip-dot {{ width:7px; height:7px; border-radius:50%; display:inline-block; }}
-      .chip-tf {{ color:var(--muted); }}
-      .chip-val {{ color:var(--text); }}
-      .divider {{ border:none; height:0; border-top:1px dashed var(--border); margin:18px 0; }}
-      .side-tag {{
-        display:inline-block; font-size:0.75em; font-weight:600; color:#14110D;
-        border-radius:6px; padding:3px 9px; margin-bottom:10px;
-      }}
-      .trade-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:8px 16px; }}
-      .trade-grid .k {{ display:block; color:var(--muted); font-size:0.72em; }}
-      .trade-grid .v {{ display:block; color:var(--text); font-size:0.95em; }}
-      .muted-line {{ color:var(--muted); font-size:0.85em; }}
-      .italic {{ font-family:'Fraunces', serif; font-style:italic; }}
-      .stat-row {{ display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }}
-      .stat-num {{ font-family:'Fraunces', serif; font-size:1.6em; color:var(--gold-bright); }}
-      .stat-label {{ color:var(--muted); font-size:0.78em; }}
-      .trade-row {{
-        display:flex; align-items:center; gap:10px; font-size:0.82em;
-        padding:5px 0; border-bottom:1px solid var(--border);
-      }}
-      .trade-row:last-child {{ border-bottom:none; }}
-      .trade-icon {{ width:14px; text-align:center; }}
-      .trade-side {{ color:var(--text); flex:1; }}
-      .trade-result {{ font-weight:600; }}
-      .trade-time {{ color:var(--muted); }}
-      .footer-note {{ color:var(--muted); font-size:0.72em; margin-top:20px; text-align:center; }}
-      .balance-line {{ color:var(--gold-bright); font-size:0.82em; margin-top:8px; }}
-    </style>
-    </head><body>
-      <div class="ticket">
-        <div class="eyebrow">Gold ticket &middot; XAUUSDT</div>
-        <div class="hero-price">{price_display}</div>
-        <div class="hero-sub">yangilangan {html.escape(time_display)}</div>
-        {_build_sparkline(price_history)}
-
-        <div class="tags">{status_chips}</div>
-        {control_button}
-
-        <div class="section">
-          <div class="section-title">Trend yo'nalishi</div>
-          <div class="chips">{bias_grid}</div>
-        </div>
-
-        <hr class="divider">
-
-        <div class="section">
-          <div class="section-title">Ochiq savdo</div>
-          {trade_block}
-        </div>
-
-        {impulse_block}
-
-        <hr class="divider">
-
-        <div class="section">
-          <div class="stat-row">
-            <span class="stat-num">{win_pct}</span>
-            <span class="stat-label">g'alaba &middot; jami {total} ta savdo</span>
-          </div>
-          {_render_recent_trades(log)}
-        </div>
-
-        <div class="balance-line">Hisob: {balance_line}</div>
-        <div class="footer-note">Signal/monitoring bot &middot; moliyaviy maslahat emas</div>
-      </div>
-    </body></html>
-    """
-
-# ==================== LOOP ====================
-def loop():
-    logger.info(f"Bot ishga tushdi - har {CHECK_INTERVAL_SEC}s")
-    next_run = time.monotonic()
-    while True:
-        try:
-            run()
-        except Exception as e:
-            logger.error(f"Xatolik: {_safe_log_error(e)}")
-            logger.error(traceback.format_exc())
-            _metrics["errors"] += 1
-        next_run += CHECK_INTERVAL_SEC
-        sleep_time = max(0, next_run - time.monotonic())
-        if sleep_time > CHECK_INTERVAL_SEC * 2:
-            next_run = time.monotonic() + CHECK_INTERVAL_SEC
-            sleep_time = CHECK_INTERVAL_SEC
-        time.sleep(sleep_time)
-
-# ==================== RESTORE ====================
-def restore_state():
-    global current_trade, warned_flip
-    if not os.path.exists(STATUS_FILE):
-        return
-    try:
-        with open(STATUS_FILE, encoding='utf-8') as file:
-            status = json.load(file)
-        saved = status.get("currentTrade")
-        if saved:
-            with state_lock:
-                current_trade = saved
-                warned_flip = False
-            age_text = _trade_age_text(saved.get("opened_at"))
-            logger.info(f"Tiklandi: {saved.get('signal')} {saved.get('entry')}{age_text}")
-            opened_at_iso = saved.get("opened_at")
-            if opened_at_iso:
-                try:
-                    opened_at = datetime.datetime.fromisoformat(opened_at_iso)
-                    elapsed_h = (datetime.datetime.now(datetime.timezone.utc) - opened_at).total_seconds() / 3600
-                    if elapsed_h > TRADE_STALE_WARNING_HOURS:
-                        send_telegram(
-                            f"⚠️ Bot qayta ishga tushdi. {saved.get('signal')} "
-                            f"savdo {elapsed_h:.1f} soat oldin ochilgan."
-                        )
-                except Exception:
-                    pass
-        else:
-            logger.info("Ochiq bitim yo'q.")
-    except json.JSONDecodeError:
-        logger.error("status.json buzilgan.")
-    except Exception as e:
-        logger.error(f"State xato: {_safe_log_error(e)}")
-
-# ==================== INIT (Railway / gunicorn uchun) ====================
-SUBSCRIBERS = load_subscribers()
-ACCOUNT = load_account()
-restore_state()
-
-_bot_started = False
-_bot_lock = threading.Lock()
-
-
-def _start_background_threads():
-    """Thread'larni faqat BIR MARTA ishga tushirish."""
-    global _bot_started
-    with _bot_lock:
-        if _bot_started:
-            logger.info("Background thread'lar allaqachon ishga tushgan.")
-            return
-        _bot_started = True
-
-    logger.info("Background thread'lar ishga tushirilmoqda...")
-    threading.Thread(target=loop, daemon=True, name="main_loop").start()
-    register_bot_commands()
-    threading.Thread(target=telegram_listener, daemon=True, name="tg_listener").start()
-    logger.info("✅ Background thread'lar ishga tushdi (loop + listener)")
-
-
-# ✅ gunicorn ham, python ham ishlatishi uchun modul darajasida
-_start_background_threads()
-
-
-# ==================== ENTRY (faqat lokal test uchun) ====================
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    if app.get("session"):
+        await app["session"].close()
+    await db.close()
+    logger.info("🛑 Bot to'xtatildi.")
+
+# ==================== APP FACTORY ====================
+async def create_app():
+    app = web.Application()
+    app.add_routes(routes)
+    app.on_startup.append(startup_tasks)
+    app.on_cleanup.append(cleanup_tasks)
+    return app
+
+# Gunicorn uchun: gunicorn main:app --worker-class aiohttp.GunicornWebWorker --workers 1
+app = create_app()
+
+# ==================== ENTRY (lokal) ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8100))
-    logger.info(f"Flask {port} portda ishga tushmoqda (lokal rejim)")
-    app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
+    logger.info(f"Lokal rejim: http://0.0.0.0:{port}")
+    web.run_app(app, host="0.0.0.0", port=port, access_log=None)
