@@ -1,27 +1,7 @@
-
 """
-GOLD (XAUUSDT) 5m/15m SMC + ICT Bot — v11 FINAL
-================================================
-Barcha versiyalar (v7, v8, v9, v10) birlashtirildi.
-Barcha ma'lum muammolar tuzatildi.
-
-Asosiy xususiyatlar:
-  ✅ aiohttp + asyncio (to'liq asinxron)
-  ✅ aiosqlite (non-blocking SQLite state)
-  ✅ Gunicorn-ready (aiohttp.GunicornWebWorker)
-  ✅ Single source of truth: faqat SQLite (JSON fayllar yo'q)
-  ✅ DST-aware session detection (zoneinfo)
-  ✅ Parallel API so'rovlar (asyncio.gather)
-  ✅ Telegram polling + flood control
-  ✅ Webhook bias filtri
-  ✅ News blackout filtri
-  ✅ Killzone filtri
-  ✅ HTF MTF filtri (1h/4h/1d)
-  ✅ Adaptive risk
-  ✅ Trailing SL / BE
-  ✅ Post-trade tracking
-  ✅ Atomic state updates
-  ✅ Graceful shutdown
+GOLD (XAUUSDT) 5m/15m SMC + ICT Bot — v12 FIXED FINAL
+=====================================================
+Barcha mantiqiy, texnik va xavfsizlik xatolari to'liq tuzatilgan versiya.
 """
 
 import asyncio
@@ -34,7 +14,6 @@ import logging
 import math
 import os
 import secrets
-import sqlite3
 import time
 import traceback
 from collections import deque
@@ -53,12 +32,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("gold_smc_bot_v11")
+logger = logging.getLogger("gold_smc_bot_v12")
 
 # ==================== KONFIGURATSIYA ====================
 SYMBOL = "XAUUSDT"
+SMT_SYMBOL = "XAGUSDT"
 BTC_SYMBOL = "BTCUSDT"
-EUR_SYMBOL = "EURUSDT"
 LIMIT = 200
 HTF_LIMIT = 100
 RR1, RR2 = 1.5, 3.0
@@ -80,8 +59,7 @@ DB_FILE = os.path.join(DATA_DIR, "gold_bot.sqlite")
 DEFAULT_RISK_PER_TRADE_PCT = 1.0
 MAX_RISK_PER_TRADE_PCT = 5.0
 
-# MUHIM: Bybit XAUUSDT perpetual uchun 1 lot = 1 troya unsiyasi.
-# Agar boshqa birja ishlatilsa, bu qiymatni tekshiring.
+# Bybit XAUUSDT perpetual uchun 1 lot = 1 troya unsiyasi.
 XAUUSD_LOT_UNITS = 1
 MIN_LOT_STEP = 0.01
 
@@ -131,6 +109,12 @@ def _safe_log_error(error):
 def closed_only(candles):
     return candles[:-1] if len(candles) > 1 else candles
 
+def _candles_signature(candles):
+    """Har bir symbol va timeframe uchun unikal kesh kaliti."""
+    if not candles:
+        return None
+    return (len(candles), candles[0][0], candles[-1][0], round(candles[0][1], 4))
+
 def in_killzone():
     if not KILLZONES_ENABLED:
         return True
@@ -174,7 +158,7 @@ def current_session():
 
 # ==================== DATABASE (aiosqlite) ====================
 class DatabaseManager:
-    """Non-blocking SQLite state manager. asyncio loop ni bloklamaydi."""
+    """Non-blocking SQLite state manager."""
 
     def __init__(self, db_path):
         self.db_path = db_path
@@ -259,8 +243,8 @@ db = DatabaseManager(DB_FILE)
 
 # ==================== MEMORY CACHE ====================
 PRICE_HISTORY = deque(maxlen=500)
-_zones_cache = {"fvg": None, "ob": None, "last_ts": 0}
-_swings_cache = {"last_ts": 0, "highs": [], "lows": []}
+_zones_cache = {}
+_swings_cache = {}
 _zone_fresh_cache = {}
 _metrics = {
     "signals": 0, "closed": 0, "wins": 0, "losses": 0,
@@ -268,6 +252,7 @@ _metrics = {
 }
 
 O, H, L, C = 1, 2, 3, 4
+WIN_RESULTS = ("TP1", "TP2", "TP1 (Trailing)")
 
 # ==================== SUBSCRIBERS / ACCOUNT ====================
 async def get_subs():
@@ -302,9 +287,9 @@ async def win_rate_text():
     total = len(results)
     if not total:
         return "Hali statistika yo'q"
-    wins = sum(1 for r in results if r in ("TP1", "TP2"))
-    breakevens = sum(1 for r in results if "BE" in r or "Trailing" in r)
-    return f"{wins / total * 100:.1f}% g'alaba, {breakevens} ta BE/Trailing, jami {total} ta savdo"
+    wins = sum(1 for r in results if r in WIN_RESULTS)
+    breakevens = sum(1 for r in results if r in ("BE", "BE/Trailing SL"))
+    return f"{wins / total * 100:.1f}% g'alaba ({wins}/{total}), {breakevens} ta BE"
 
 # ==================== BYBIT API (async) ====================
 async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
@@ -324,7 +309,7 @@ async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
         return [[int(x[0]), float(x[1]), float(x[2]), float(x[3]),
                  float(x[4]), float(x[5])] for x in rows]
 
-# ==================== INDICATORS ====================
+# ==================== INDICATORS & SMC LOGIC ====================
 def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
     highs, lows = [], []
     n = len(candles)
@@ -337,9 +322,13 @@ def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
             if offset == 0:
                 continue
             other = candles[i + offset]
-            if other[H] > ch:
+            if other[H] >= ch and offset < 0:
                 is_high = False
-            if other[L] < cl:
+            elif other[H] > ch:
+                is_high = False
+            if other[L] <= cl and offset < 0:
+                is_low = False
+            elif other[L] < cl:
                 is_low = False
             if not is_high and not is_low:
                 break
@@ -352,29 +341,47 @@ def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
 def get_swings_cached(candles, left=SWING_LEFT, right=SWING_RIGHT):
     if not candles:
         return [], []
-    ts = candles[-1][0]
-    if _swings_cache["last_ts"] == ts:
-        return _swings_cache["highs"], _swings_cache["lows"]
+    sig = (_candles_signature(candles), left, right)
+    if sig in _swings_cache:
+        return _swings_cache[sig]
     h, l = find_swings(candles, left, right)
-    _swings_cache.update({"last_ts": ts, "highs": h, "lows": l})
+    if len(_swings_cache) > 100:
+        _swings_cache.clear()
+    _swings_cache[sig] = (h, l)
     return h, l
 
 def confirmed_structure_bias(candles):
+    """
+    To'liq BOS / CHoCH holat mashinasi:
+    Korreksiya (pullback) vaqtida ham oxirgi tasdiqlangan struktura yo'nalishini saqlab qoladi.
+    """
     highs, lows = get_swings_cached(candles)
     if not highs or not lows:
         return None
-    lhi, lhp = highs[-1]
-    lli, llp = lows[-1]
-    start = max(lhi, lli) + 1
+
+    h_map = {idx: price for idx, price in highs}
+    l_map = {idx: price for idx, price in lows}
+
+    active_h = None
+    active_l = None
     bias = None
-    for i in range(start, len(candles)):
+
+    for i in range(len(candles)):
         c = candles[i][C]
-        if c > lhp:
+        if active_h is not None and c > active_h:
             bias = "bullish"
-            llp = min(llp, candles[i][L])
-        elif c < llp:
+            active_h = None  # Keyingi swing high hosil bo'lguncha kutadi
+        elif active_l is not None and c < active_l:
             bias = "bearish"
-            lhp = max(lhp, candles[i][H])
+            active_l = None
+
+        # Swing nuqta o'ng tarafdan tasdiqlangach faollashadi
+        confirm_idx = i - SWING_RIGHT
+        if confirm_idx in h_map:
+            active_h = h_map[confirm_idx]
+        if confirm_idx in l_map:
+            active_l = l_map[confirm_idx]
+
     return bias
 
 def detect_impulse(candles, lookback=20, threshold=2.2):
@@ -413,20 +420,27 @@ def detect_order_blocks(candles):
     bodies = [abs(c[C] - c[O]) for c in candles]
     vols = [c[5] if len(c) > 5 else 0 for c in candles]
     obs = []
-    for i in range(10, len(candles) - 1):
+    n = len(candles)
+    for i in range(10, n - 1):
         ab = sum(bodies[i - 10:i]) / 10
         av = sum(vols[i - 10:i]) / 10
         if ab == 0 or av == 0:
             continue
-        ib = bodies[i + 1] > ab * 1.5
-        iv = vols[i + 1] > av * 2.0
         cur, fol = candles[i], candles[i + 1]
-        bob = cur[C] < cur[O] and fol[C] > fol[O]
-        beob = cur[C] > cur[O] and fol[C] < fol[O]
-        if ib and iv and bob:
+        ib = bodies[i + 1] > ab * 1.5
+        iv = vols[i + 1] > av * 1.5
+
+        # Displacement / Imbalance tekshiruvi
+        has_fvg_bull = (i + 2 < n and candles[i + 2][L] > cur[H])
+        has_fvg_bear = (i + 2 < n and candles[i + 2][H] < cur[L])
+
+        bob = cur[C] < cur[O] and fol[C] > cur[H] and (ib and (iv or has_fvg_bull))
+        beob = cur[C] > cur[O] and fol[C] < cur[L] and (ib and (iv or has_fvg_bear))
+
+        if bob:
             obs.append({"type": "bullish", "kind": "ob",
                         "top": cur[O], "bottom": cur[L], "index": i})
-        if ib and iv and beob:
+        if beob:
             obs.append({"type": "bearish", "kind": "ob",
                         "top": cur[H], "bottom": cur[O], "index": i})
     return obs
@@ -434,33 +448,50 @@ def detect_order_blocks(candles):
 def get_zones_cached(candles):
     if not candles:
         return []
-    ts = candles[-1][0]
-    if _zones_cache["last_ts"] == ts and _zones_cache["fvg"] is not None:
-        return _zones_cache["fvg"] + _zones_cache["ob"]
-    fvg = detect_fvg(candles)
-    ob = detect_order_blocks(candles)
-    _zones_cache.update({"fvg": fvg, "ob": ob, "last_ts": ts})
-    return fvg + ob
+    sig = _candles_signature(candles)
+    if sig in _zones_cache:
+        return _zones_cache[sig]
+    zones = detect_fvg(candles) + detect_order_blocks(candles)
+    if len(_zones_cache) > 100:
+        _zones_cache.clear()
+    _zones_cache[sig] = zones
+    return zones
 
-def _zone_is_fresh(zone, candles, max_age_bars=20):
+def _zone_is_fresh(zone, candles, max_age_bars=80):
     fi = zone["index"]
-    if len(candles) - 1 - fi > max_age_bars:
+    n = len(candles)
+    if n - 1 - fi > max_age_bars:
         return False
-    key = (fi, candles[-1][0])
-    if key in _zone_fresh_cache:
-        return _zone_fresh_cache[key]
+    sig = (_candles_signature(candles), fi, zone["kind"], zone["type"])
+    if sig in _zone_fresh_cache:
+        return _zone_fresh_cache[sig]
+
     res = True
-    for i in range(fi + 1, len(candles)):
-        c = candles[i][C]
-        if zone["type"] == "bullish" and c < zone["bottom"]:
-            res = False
-            break
-        if zone["type"] == "bearish" and c > zone["top"]:
-            res = False
-            break
+    mid = (zone["top"] + zone["bottom"]) / 2.0
+
+    # Impuls shamidan keyingi shamlarda zona buzilgani yoki 50% dan chuqur mitigated bo'lganini tekshirish
+    start_check = fi + 2 if zone["kind"] == "ob" else fi + 1
+    for i in range(start_check, n):
+        c = candles[i]
+        if zone["type"] == "bullish":
+            if c[C] < zone["bottom"]:
+                res = False
+                break
+            # Agar avvalgi shamlarda zonaning 50% qismiga kirib chiqib ketgan bo'lsa (mitigated)
+            if i < n - 2 and c[L] <= mid and c[C] > zone["top"]:
+                res = False
+                break
+        else:
+            if c[C] > zone["top"]:
+                res = False
+                break
+            if i < n - 2 and c[H] >= mid and c[C] < zone["bottom"]:
+                res = False
+                break
+
     if len(_zone_fresh_cache) > 500:
         _zone_fresh_cache.clear()
-    _zone_fresh_cache[key] = res
+    _zone_fresh_cache[sig] = res
     return res
 
 def calculate_atr(candles, period=14):
@@ -475,21 +506,27 @@ def calculate_atr(candles, period=14):
         ))
     return sum(trs[-period:]) / period
 
-def calculate_vwap(candles, lookback=48):
-    cpv, cv = 0, 0
-    for c in candles[-lookback:]:
-        tp = (c[H] + c[L] + c[C]) / 3
-        v = c[5] if len(c) > 5 else 0
+def calculate_vwap(candles, fallback_lookback=48):
+    """Kunlik (00:00 UTC dan boshlangan) haqiqiy Session VWAP."""
+    if not candles:
+        return None
+    last_day = candles[-1][0] // 86_400_000
+    session_candles = [c for c in candles if (c[0] // 86_400_000) == last_day]
+    if len(session_candles) < 4:
+        session_candles = candles[-fallback_lookback:]
+    cpv, cv = 0.0, 0.0
+    for c in session_candles:
+        tp = (c[H] + c[L] + c[C]) / 3.0
+        v = c[5] if len(c) > 5 else 0.0
         cpv += tp * v
         cv += v
     return cpv / cv if cv > 0 else None
 
 async def adaptive_risk_pct(base_risk):
     results = await db.get_all_results()
-    total = len(results)
-    if total < 10:
+    if len(results) < 10:
         return base_risk
-    wins = sum(1 for r in results if r in ("TP1", "TP2"))
+    wins = sum(1 for r in results if r in WIN_RESULTS)
     losses = sum(1 for r in results if r == "SL")
     denom = wins + losses
     if denom < 10:
@@ -497,7 +534,7 @@ async def adaptive_risk_pct(base_risk):
     wr = wins / denom
     if wr > 0.65:
         return min(base_risk * 1.5, MAX_RISK_PER_TRADE_PCT)
-    if wr < 0.4:
+    if wr < 0.40:
         return max(base_risk * 0.5, 0.1)
     return base_risk
 
@@ -524,7 +561,7 @@ def build_trade(candles, bias, price, atr):
         if other["index"] != zone["index"] or other["kind"] != zone["kind"]
     )
 
-    sl_buf = atr * 0.15 if atr else price * 0.001
+    sl_buf = atr * 0.20 if atr else price * 0.001
     entry = price
     if bias == "bullish":
         sl = zone["bottom"] - sl_buf
@@ -538,7 +575,7 @@ def build_trade(candles, bias, price, atr):
             "tp2": round(entry + risk * RR2, 2),
             "confluence": confluence,
             "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "breakeven": False, "tp1_notified": False,
+            "breakeven": False, "tp1_notified": False, "stale_warned": False,
         }
     else:
         sl = zone["top"] + sl_buf
@@ -552,7 +589,7 @@ def build_trade(candles, bias, price, atr):
             "tp2": round(entry - risk * RR2, 2),
             "confluence": confluence,
             "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "breakeven": False, "tp1_notified": False,
+            "breakeven": False, "tp1_notified": False, "stale_warned": False,
         }
 
 def calc_lot(entry, sl, balance, risk_pct):
@@ -609,13 +646,15 @@ async def close_trade(session, trade, result, price):
 
     await db.insert_trade(trade, result, price, lot, usd_risk, trade.get("confirmations", ""))
     _metrics["closed"] += 1
-    if result in ("TP1", "TP2"):
+    if result in WIN_RESULTS:
         _metrics["wins"] += 1
     elif result == "SL":
         _metrics["losses"] += 1
 
-    emoji = {"TP2": "✅", "SL": "❌", "BE": "➖", "MANUAL": "🛑",
-             "BE/Trailing SL": "🛡"}.get(result, "ℹ️")
+    emoji = {
+        "TP2": "✅", "TP1 (Trailing)": "✅🛡", "SL": "❌",
+        "BE": "➖", "MANUAL": "🛑", "BE/Trailing SL": "🛡",
+    }.get(result, "ℹ️")
     stat = await win_rate_text()
     await send_telegram(
         session,
@@ -623,7 +662,7 @@ async def close_trade(session, trade, result, price):
         f"Statistika: {stat}",
     )
 
-async def monitor_trade(session, price, bias15):
+async def monitor_trade(session, price, candle_high, candle_low, bias15):
     trade = await db.state_get("current_trade")
     if not trade:
         return
@@ -634,41 +673,59 @@ async def monitor_trade(session, price, bias15):
     tp2 = trade["tp2"]
     notes = []
     to_close = None
-    sl_changed = False
 
-    tp1_hit = (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
-    if tp1_hit and not trade.get("tp1_notified"):
-        trade["tp1_notified"] = True
-        notes.append(f"🎯 TP1 ga yetdi: {tp1}")
+    high_p = max(price, candle_high)
+    low_p = min(price, candle_low)
 
-    if side == "LONG" and price >= tp1:
-        new_sl = entry + (price - entry) * 0.5
-        if new_sl > trade["sl"]:
-            trade["sl"] = round(new_sl, 2)
-            trade["breakeven"] = True
-            sl_changed = True
-            notes.append(f"🔥 LONG trailing SL: {trade['sl']}")
-    elif side == "SHORT" and price <= tp1:
-        new_sl = entry - (entry - price) * 0.5
-        if new_sl < trade["sl"]:
-            trade["sl"] = round(new_sl, 2)
-            trade["breakeven"] = True
-            sl_changed = True
-            notes.append(f"🔥 SHORT trailing SL: {trade['sl']}")
-
-    sl_hit = (side == "LONG" and price <= trade["sl"]) or (side == "SHORT" and price >= trade["sl"])
-    tp2_hit = (side == "LONG" and price >= tp2) or (side == "SHORT" and price <= tp2)
+    # Oldingi SL holati bo'yicha birinchi tekshirish
+    sl_hit = (side == "LONG" and low_p <= trade["sl"]) or (side == "SHORT" and high_p >= trade["sl"])
+    tp2_hit = (side == "LONG" and high_p >= tp2) or (side == "SHORT" and low_p <= tp2)
 
     if sl_hit:
-        to_close = ("BE/Trailing SL" if trade.get("breakeven") else "SL", price)
+        if trade.get("tp1_notified"):
+            to_close = ("TP1 (Trailing)", trade["sl"])
+        elif trade.get("breakeven"):
+            to_close = ("BE", trade["sl"])
+        else:
+            to_close = ("SL", trade["sl"])
     elif tp2_hit:
-        to_close = ("TP2", price)
-    elif bias15 is not None and bias15 != trade["bias"]:
-        counter = (await db.state_get("flip_counter", 0)) + 1
-        await db.state_set("flip_counter", counter)
-        if counter >= FLIP_WARN_INTERVAL_CHECKS:
-            notes.append(f"⚠️ {side} ochiq, lekin struktura {bias15} ga o'zgardi.")
-            await db.state_set("flip_counter", 0)
+        to_close = ("TP2", tp2)
+    else:
+        tp1_hit = (side == "LONG" and high_p >= tp1) or (side == "SHORT" and low_p <= tp1)
+        if tp1_hit and not trade.get("tp1_notified"):
+            trade["tp1_notified"] = True
+            notes.append(f"🎯 TP1 ga yetdi: {tp1}")
+
+        if side == "LONG" and high_p >= tp1:
+            new_sl = entry + (high_p - entry) * 0.5
+            if new_sl > trade["sl"]:
+                trade["sl"] = round(new_sl, 2)
+                trade["breakeven"] = True
+                notes.append(f"🔥 LONG trailing SL: {trade['sl']}")
+        elif side == "SHORT" and low_p <= tp1:
+            new_sl = entry - (entry - low_p) * 0.5
+            if new_sl < trade["sl"]:
+                trade["sl"] = round(new_sl, 2)
+                trade["breakeven"] = True
+                notes.append(f"🔥 SHORT trailing SL: {trade['sl']}")
+
+        if bias15 is not None and bias15 != trade["bias"]:
+            counter = (await db.state_get("flip_counter", 0)) + 1
+            await db.state_set("flip_counter", counter)
+            if counter >= FLIP_WARN_INTERVAL_CHECKS:
+                notes.append(f"⚠️ {side} ochiq, lekin 15m struktura {bias15} ga o'zgardi.")
+                await db.state_set("flip_counter", 0)
+
+        # Eskirgan bitim (Stale trade) ogohlantirishi
+        if trade.get("opened_at") and not trade.get("stale_warned"):
+            try:
+                opened_dt = datetime.datetime.fromisoformat(trade["opened_at"])
+                age_hours = (datetime.datetime.now(datetime.timezone.utc) - opened_dt).total_seconds() / 3600
+                if age_hours >= TRADE_STALE_WARNING_HOURS:
+                    trade["stale_warned"] = True
+                    notes.append(f"⏳ Bitim {TRADE_STALE_WARNING_HOURS} soatdan beri ochiq ({side}, Entry: {entry}).")
+            except Exception:
+                pass
 
     await db.state_set("current_trade", trade)
     for n in notes:
@@ -723,9 +780,9 @@ async def is_news_blackout(session):
 
 # ==================== HTF ====================
 async def fetch_htf_bias(session):
-    c_time = time.monotonic()
+    c_time = time.time()
     cache = await db.state_get("htf_cache", {"b1h": None, "b4h": None, "b1d": None, "ts": 0})
-    if c_time - cache.get("ts", 0) < 60:
+    if 0 <= c_time - cache.get("ts", 0) < 60:
         return cache["b1h"], cache["b4h"], cache["b1d"]
 
     tasks = [
@@ -756,6 +813,40 @@ def mtf_alignment_score(b5, b15, b1h, b4h):
         score += 1
     return score
 
+# ==================== SMT DIVERGENCE ====================
+def detect_smt_divergence(gold_candles, ref_candles):
+    """
+    Haqiqiy ICT SMT Divergence:
+    Oltin va korrelyatsiyadagi aktivning (XAGUSDT yoki BTCUSDT) oxirgi 2 ta swing nuqtalarini solishtiradi.
+    """
+    if not gold_candles or not ref_candles:
+        return None
+    gh, gl = get_swings_cached(gold_candles)
+    rh, rl = get_swings_cached(ref_candles)
+
+    bull_smt, bear_smt = False, False
+    if len(gl) >= 2 and len(rl) >= 2:
+        g_ll = gl[-1][1] < gl[-2][1]
+        r_hl = rl[-1][1] > rl[-2][1]
+        g_hl = gl[-1][1] > gl[-2][1]
+        r_ll = rl[-1][1] < rl[-2][1]
+        if (g_ll and r_hl) or (g_hl and r_ll):
+            bull_smt = True
+
+    if len(gh) >= 2 and len(rh) >= 2:
+        g_hh = gh[-1][1] > gh[-2][1]
+        r_lh = rh[-1][1] < rh[-2][1]
+        g_lh = gh[-1][1] < gh[-2][1]
+        r_hh = rh[-1][1] > rh[-2][1]
+        if (g_hh and r_lh) or (g_lh and r_hh):
+            bear_smt = True
+
+    if bull_smt and not bear_smt:
+        return "bullish"
+    if bear_smt and not bull_smt:
+        return "bearish"
+    return None
+
 # ==================== MAIN CYCLE ====================
 async def run_bot_cycle(session):
     try:
@@ -768,6 +859,8 @@ async def run_bot_cycle(session):
         cl15 = closed_only(c15)
         cl5 = closed_only(c5)
         price = c15[-1][C] + PRICE_OFFSET
+        candle_high = c5[-1][H] + PRICE_OFFSET
+        candle_low = c5[-1][L] + PRICE_OFFSET
 
         b15 = confirmed_structure_bias(cl15)
         b5 = confirmed_structure_bias(cl5)
@@ -795,10 +888,10 @@ async def run_bot_cycle(session):
         # Ochiq bitim bo'lsa — monitoring
         trade = await db.state_get("current_trade")
         if trade:
-            await monitor_trade(session, price, b15)
+            await monitor_trade(session, price, candle_high, candle_low, b15)
             return
 
-        # Pauza
+        # Pauza va Filtrlar
         if await db.state_get("paused", False):
             return
         if KILLZONES_ENABLED and not in_killzone():
@@ -822,7 +915,7 @@ async def run_bot_cycle(session):
         new_trade = build_trade(cl15, b15, price, atr15)
         if not new_trade:
             return
-        if atr15 and abs(new_trade["entry"] - new_trade["sl"]) < atr15:
+        if atr15 and abs(new_trade["entry"] - new_trade["sl"]) < atr15 * 0.8:
             return
 
         # Confirmations
@@ -834,32 +927,35 @@ async def run_bot_cycle(session):
         vp15 = volume_profile(cl15)
         session_name = current_session()
 
-        btc_bias, eur_bias = None, None
+        btc_bias, smt_dir, xag_bias = None, None, None
         try:
             btc_c = await fetch_ohlcv(session, "15m", symbol=BTC_SYMBOL)
-            btc_bias = confirmed_structure_bias(closed_only(btc_c))
+            btc_cl = closed_only(btc_c)
+            btc_bias = confirmed_structure_bias(btc_cl)
         except Exception as e:
-            logger.warning(f"BTC: {_safe_log_error(e)}")
+            logger.warning(f"BTC fetch: {_safe_log_error(e)}")
+
         try:
-            eur_c = await fetch_ohlcv(session, "15m", symbol=EUR_SYMBOL)
-            eur_bias = confirmed_structure_bias(closed_only(eur_c))
-        except Exception as e:
-            logger.warning(f"EUR: {_safe_log_error(e)}")
+            xag_c = await fetch_ohlcv(session, "15m", symbol=SMT_SYMBOL)
+            xag_cl = closed_only(xag_c)
+            xag_bias = confirmed_structure_bias(xag_cl)
+            smt_dir = detect_smt_divergence(cl15, xag_cl)
+        except Exception:
+            if btc_bias is not None:
+                smt_dir = detect_smt_divergence(cl15, btc_cl)
 
         confirmations = confirmation_check(
             b15, price, vwap15, bull_div, bear_div,
-            btc_bias, eur_bias, new_trade.get("confluence", False),
-            sweep=sweep15, delta=delta15, vp=vp15, session=session_name,
+            btc_bias, xag_bias, smt_dir,
+            new_trade.get("confluence", False),
+            sweep=sweep15, delta=delta15, vp=vp15,
         )
-        mtf = mtf_alignment_score(b5, b15, b1h, b4h)
-        if mtf >= 3:
-            confirmations.append(f"MTF: {mtf}/3 (kuchli)")
-        elif mtf == 2:
-            confirmations.append(f"MTF: {mtf}/3")
 
+        # Kamida 2 ta HAQIQIY texnik tasdiq bo'lishi shart
         if len(confirmations) < 2:
             return
 
+        mtf = mtf_alignment_score(b5, b15, b1h, b4h)
         acc = await get_account()
         adj_risk = await adaptive_risk_pct(acc["risk_pct"])
         lot = calc_lot(new_trade["entry"], new_trade["sl"], acc["balance"], adj_risk) if acc["balance"] else None
@@ -873,13 +969,13 @@ async def run_bot_cycle(session):
             f"Entry: {new_trade['entry']} | SL: {new_trade['sl']}\n"
             f"TP1: {new_trade['tp1']} | TP2: {new_trade['tp2']}\n"
             f"ATR(15m): {round(atr15, 2) if atr15 else 'n/a'}\n"
-            f"BTC: {btc_bias or 'n/a'} | EUR: {eur_bias or 'n/a'}\n"
+            f"BTC: {btc_bias or 'n/a'} | XAG: {xag_bias or 'n/a'} | SMT: {smt_dir or 'yoq'}\n"
             f"VP: POC={vp15['poc'] if vp15 else 'n/a'} "
             f"VAH={vp15['vah'] if vp15 else 'n/a'} "
             f"VAL={vp15['val'] if vp15 else 'n/a'}\n"
             f"Delta: {delta15}\n"
             f"Confluence: {'ha' if new_trade.get('confluence') else 'yoq'}\n"
-            f"Tasdiq: {', '.join(confirmations)}\n"
+            f"Tasdiq ({len(confirmations)}): {', '.join(confirmations)}\n"
             f"Lot: {lot or 'Kiritilmagan'}\n"
             f"Win rate: {await win_rate_text()}"
         )
@@ -895,47 +991,41 @@ async def run_bot_cycle(session):
 
 # ==================== CONFIRMATIONS ====================
 def confirmation_check(bias, price, vwap, bull_div, bear_div,
-                       btc_bias=None, eur_bias=None,
+                       btc_bias=None, xag_bias=None, smt_dir=None,
                        zone_confluence=False, sweep=None, delta=None,
-                       vp=None, session=None):
+                       vp=None):
     confs = []
     if bias == "bullish":
         if bull_div:
             confs.append("RSI divergence (bullish)")
         if vwap is not None and price > vwap:
-            confs.append("Narx VWAP ustida")
-        if btc_bias == "bullish" and eur_bias == "bullish":
-            confs.append("SMT: BTC + EUR mos")
-        elif btc_bias == "bullish":
-            confs.append("SMT: BTC bullish")
-        elif eur_bias == "bullish":
-            confs.append("SMT: EUR bullish")
+            confs.append("Narx Session VWAP ustida")
+        if smt_dir == "bullish":
+            confs.append("SMT Divergence (Bullish)")
+        elif btc_bias == "bullish" and xag_bias == "bullish":
+            confs.append("Korrelyatsiya: BTC + XAG bullish")
         if sweep == "bullish_sweep":
             confs.append("Likvidlik yig'ildi (Bullish Sweep)")
         if delta is not None and delta > 0:
             confs.append(f"Order Flow delta +{delta}")
-        if vp and price < vp["val"]:
-            confs.append("Narx Value Area pastida")
+        if vp and price <= vp["poc"]:
+            confs.append("Discount (POC/VAL ostida)")
     else:
         if bear_div:
             confs.append("RSI divergence (bearish)")
         if vwap is not None and price < vwap:
-            confs.append("Narx VWAP ostida")
-        if btc_bias == "bearish" and eur_bias == "bearish":
-            confs.append("SMT: BTC + EUR mos")
-        elif btc_bias == "bearish":
-            confs.append("SMT: BTC bearish")
-        elif eur_bias == "bearish":
-            confs.append("SMT: EUR bearish")
+            confs.append("Narx Session VWAP ostida")
+        if smt_dir == "bearish":
+            confs.append("SMT Divergence (Bearish)")
+        elif btc_bias == "bearish" and xag_bias == "bearish":
+            confs.append("Korrelyatsiya: BTC + XAG bearish")
         if sweep == "bearish_sweep":
             confs.append("Likvidlik yig'ildi (Bearish Sweep)")
         if delta is not None and delta < 0:
             confs.append(f"Order Flow delta {delta}")
-        if vp and price > vp["vah"]:
-            confs.append("Narx Value Area ustida")
+        if vp and price >= vp["poc"]:
+            confs.append("Premium (POC/VAH ustida)")
 
-    if session in ("london", "london_ny_overlap", "newyork", "asia"):
-        confs.append(f"Sessiya: {session}")
     if zone_confluence:
         confs.append("Zone confluence (FVG + OB)")
     return confs
@@ -964,8 +1054,8 @@ def calculate_rsi(candles, period=14):
         rsis.append(100 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss)))
     return rsis
 
-def detect_rsi_divergence(candles, rsis, lookback=20):
-    if len(candles) < lookback or lookback < 7:
+def detect_rsi_divergence(candles, rsis, lookback=30):
+    if len(candles) < lookback or lookback < 10:
         return False, False
     window = candles[-lookback:]
     offset = len(candles) - lookback
@@ -992,10 +1082,8 @@ def detect_liquidity_sweep(candles):
         return None
     last_high = highs[-1][1]
     last_low = lows[-1][1]
-    candidates = [candles[-1]]
-    if len(candles) >= 2:
-        candidates.append(candles[-2])
-    for c in candidates:
+    candidates = candles[-3:] if len(candles) >= 3 else candles[-1:]
+    for c in reversed(candidates):
         if c[H] > last_high and c[C] < last_high:
             return "bearish_sweep"
         if c[L] < last_low and c[C] > last_low:
@@ -1003,27 +1091,38 @@ def detect_liquidity_sweep(candles):
     return None
 
 # ==================== VOLUME PROFILE ====================
-def volume_profile(candles, bins=20, lookback=100):
+def volume_profile(candles, bins=24, lookback=100):
+    """Hajmni shamning Low va High oralig'idagi barcha binlarga proporsional taqsimlaydi."""
     window = candles[-lookback:] if len(candles) >= lookback else candles
     if len(window) < 2:
         return None
     highs = [c[H] for c in window]
     lows = [c[L] for c in window]
     pmin, pmax = min(lows), max(highs)
-    if pmax == pmin:
+    if pmax <= pmin:
         return None
     bins = min(bins, max(2, len(window) // 2))
     bsize = (pmax - pmin) / bins
     profile = [0.0] * bins
+
     for c in window:
-        v = c[5] if len(c) > 5 else 0
-        idx = int((c[C] - pmin) / bsize)
-        idx = max(0, min(bins - 1, idx))
-        profile[idx] += v
+        v = c[5] if len(c) > 5 else 0.0
+        if v <= 0:
+            continue
+        start_bin = max(0, min(bins - 1, int((c[L] - pmin) / bsize)))
+        end_bin = max(0, min(bins - 1, int((c[H] - pmin) / bsize)))
+        span = end_bin - start_bin + 1
+        vol_per_bin = v / span
+        for b in range(start_bin, end_bin + 1):
+            profile[b] += vol_per_bin
+
+    total = sum(profile)
+    if total <= 0:
+        return None
+
     poc_idx = profile.index(max(profile))
     poc = pmin + (poc_idx + 0.5) * bsize
-    total = sum(profile)
-    target = total * 0.7
+    target = total * 0.70
     acc = profile[poc_idx]
     up, dn = poc_idx, poc_idx
     while acc < target and (up < bins - 1 or dn > 0):
@@ -1042,12 +1141,12 @@ def volume_profile(candles, bins=20, lookback=100):
     return {"poc": round(poc, 2), "vah": round(vah, 2), "val": round(val, 2)}
 
 def order_flow_delta(candles, lookback=20):
-    delta = 0
+    delta = 0.0
     for c in candles[-lookback:]:
         rng = c[H] - c[L]
         if rng == 0:
             continue
-        v = c[5] if len(c) > 5 else 0
+        v = c[5] if len(c) > 5 else 0.0
         delta += ((c[C] - c[O]) / rng) * v
     return round(delta, 2)
 
@@ -1187,7 +1286,7 @@ async def home(request):
 
     trade_html = "Yo'q"
     if t:
-        trade_html = (
+        trade_html = html.escape(
             f"{t['signal']} | Entry: {t['entry']} | SL: {t['sl']} | "
             f"TP1: {t['tp1']} | TP2: {t['tp2']}"
         )
@@ -1197,7 +1296,7 @@ async def home(request):
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="5">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gold SMC v11</title>
+<title>Gold SMC v12</title>
 <style>
   body {{ background:#14110D; color:#EDE3CF; font-family: monospace; padding:20px; margin:0; }}
   .card {{ background:#1C1710; border:1px solid #33291C; border-radius:14px;
@@ -1205,10 +1304,6 @@ async def home(request):
   h2 {{ font-size:2em; margin:0 0 8px; }}
   .tag {{ display:inline-block; padding:4px 10px; border-radius:8px;
           background:#33291C; margin:4px 4px 4px 0; font-size:0.85em; }}
-  .btn {{ display:block; text-align:center; padding:12px; border-radius:10px;
-          text-decoration:none; margin:14px 0; font-weight:bold; }}
-  .start {{ background:#C9A227; color:#14110D; }}
-  .pause {{ background:#C0553B; color:#fff; }}
   hr {{ border:none; border-top:1px dashed #33291C; margin:16px 0; }}
   .muted {{ color:#8C8271; font-size:0.85em; }}
   .gold {{ color:#E4C047; }}
@@ -1216,38 +1311,24 @@ async def home(request):
 </head><body>
   <div class="card">
     <h2>{price_disp}</h2>
-    <div class="muted">yangilangan: {s.get('time', '---')}</div>
+    <div class="muted">yangilangan: {html.escape(str(s.get('time', '---')))}</div>
     <div style="margin-top:10px">
-      <span class="tag">{'⏸ Pauza' if paused else '▶ Ishlamoqda'}</span>
-      <span class="tag">5m: {s.get('b5', '-')}</span>
-      <span class="tag">15m: {s.get('b15', '-')}</span>
-      <span class="tag">1h: {s.get('b1h', '-')}</span>
-      <span class="tag">4h: {s.get('b4h', '-')}</span>
-      <span class="tag">1D: {s.get('b1d', '-')}</span>
+      <span class="tag">{'⏸ Pauza (TG orqali)' if paused else '▶ Ishlamoqda'}</span>
+      <span class="tag">5m: {html.escape(str(s.get('b5', '-')))}</span>
+      <span class="tag">15m: {html.escape(str(s.get('b15', '-')))}</span>
+      <span class="tag">1h: {html.escape(str(s.get('b1h', '-')))}</span>
+      <span class="tag">4h: {html.escape(str(s.get('b4h', '-')))}</span>
+      <span class="tag">1D: {html.escape(str(s.get('b1d', '-')))}</span>
     </div>
-    <a href="{'start_bot' if paused else 'pause_bot'}"
-       class="btn {'start' if paused else 'pause'}">
-       {'▶ Start' if paused else '⏸ Pause'}
-    </a>
     <hr>
     <h3>Ochiq bitim</h3>
     <div>{trade_html}</div>
     <hr>
     <div class="muted">Hisob: ${acc.get('balance') or 0} | Risk: {acc.get('risk_pct')}%</div>
-    <div class="gold" style="margin-top:8px">{await win_rate_text()}</div>
+    <div class="gold" style="margin-top:8px">{html.escape(await win_rate_text())}</div>
   </div>
 </body></html>"""
     return web.Response(text=html_page, content_type="text/html")
-
-@routes.get("/start_bot")
-async def start_bot(request):
-    await db.state_set("paused", False)
-    raise web.HTTPFound("/")
-
-@routes.get("/pause_bot")
-async def pause_bot(request):
-    await db.state_set("paused", True)
-    raise web.HTTPFound("/")
 
 @routes.get("/health")
 async def health(request):
@@ -1285,14 +1366,14 @@ async def webhook(request):
         return web.json_response({"ok": False, "error": "disabled"}, status=403)
     try:
         data = await request.json()
-        if data.get("secret") != WEBHOOK_SECRET:
+        provided_secret = str(data.get("secret", ""))
+        if not secrets.compare_digest(provided_secret, str(WEBHOOK_SECRET)):
             return web.json_response({"ok": False, "error": "invalid secret"}, status=403)
 
-        action = data.get("action", "").upper()
+        action = str(data.get("action", "")).upper()
         if action not in ("LONG", "SHORT"):
             return web.json_response({"ok": False, "error": "invalid action"}, status=400)
 
-        # Bias filtri
         s = await db.state_get("last_status", {})
         b15 = s.get("b15")
         if await db.state_get("paused", False):
@@ -1308,10 +1389,28 @@ async def webhook(request):
             ))
             return web.json_response({"ok": True, "skipped": "bias_mismatch"})
 
+        # Agar webhook'da entry va sl berilgan bo'lsa, bitimni avto-kuzatuvga oladi
+        if "entry" in data and "sl" in data:
+            entry = float(data["entry"])
+            sl = float(data["sl"])
+            risk = abs(entry - sl)
+            tp1 = float(data.get("tp1", entry + risk * RR1 if action == "LONG" else entry - risk * RR1))
+            tp2 = float(data.get("tp2", entry + risk * RR2 if action == "LONG" else entry - risk * RR2))
+            tv_trade = {
+                "signal": action, "bias": expected,
+                "entry": round(entry, 2), "sl": round(sl, 2),
+                "tp1": round(tp1, 2), "tp2": round(tp2, 2),
+                "confluence": True, "confirmations": "TradingView Webhook",
+                "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "breakeven": False, "tp1_notified": False, "stale_warned": False,
+            }
+            await db.state_set("current_trade", tv_trade)
+            _metrics["signals"] += 1
+
         asyncio.create_task(send_telegram(
             request.app["session"],
-            f"📩 TradingView: {action} {data.get('symbol', '?')}\n"
-            f"Narx: {data.get('price', '?')}\n{data.get('message', '')}",
+            f"📩 TradingView: {action} {data.get('symbol', SYMBOL)}\n"
+            f"Narx: {data.get('price', data.get('entry', '?'))}\n{data.get('message', '')}",
         ))
         return web.json_response({"ok": True})
     except Exception as e:
@@ -1369,7 +1468,7 @@ async def startup_tasks(app):
     await register_bot_commands(app["session"])
     app["bot_task"] = asyncio.create_task(trading_loop(app), name="trading_loop")
     app["tg_task"] = asyncio.create_task(telegram_listener(app), name="tg_listener")
-    logger.info("✅ Bot ishga tushdi (v11 FINAL)")
+    logger.info("✅ Bot ishga tushdi (v12 FIXED FINAL)")
 
 async def cleanup_tasks(app):
     for key in ("bot_task", "tg_task"):

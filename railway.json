@@ -1,7 +1,7 @@
 {
   "build": { "builder": "NIXPACKS" },
   "deploy": {
-    "startCommand": "gunicorn main:app --worker-class aiohttp.GunicornWebWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 120",
+    "startCommand": "gunicorn uuf_fixed6:app --worker-class aiohttp.GunicornWebWorker --workers 1 --bind 0.0.0.0:$PORT --timeout 120",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
