@@ -317,54 +317,96 @@ async def win_rate_text():
     wr = (wins / denom * 100) if denom > 0 else 0.0
     return f"WR: {wr:.1f}% ({wins}✅ / {losses}❌ / {be}🛡 | Jami: {total})"
 
-# ==================== GEMINI AI ENGINE (Zero-Dependency) ====================
+# ==================== GEMINI AI ENGINE (AUTO-MODEL + PRO FALLBACK) ====================
+_WORKING_GEMINI_MODEL = None
+_GEMINI_MODEL_CANDIDATES = [
+    "gemini-2.5-pro",
+    "gemini-3.1-pro-preview",
+    "gemini-pro-latest",
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.0-flash",
+]
+
+async def _discover_available_gemini_model(session):
+    """Agar standart nomlar 404 bersa, API kalitda ochiq turgan eng kuchli modelni topadi."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
+    try:
+        async with session.get(url, timeout=10) as r:
+            if r.status != 200:
+                return None
+            data = await r.json()
+            models = []
+            for m in data.get("models", []):
+                methods = m.get("supportedGenerationMethods", [])
+                name = m.get("name", "").replace("models/", "")
+                if "generateContent" in methods and "gemini" in name and "vision" not in name:
+                    models.append(name)
+            # Avval 'pro', keyin 'flash' modellarni saralash
+            for pref in ("2.5-pro", "pro", "2.5-flash", "flash"):
+                for m_name in models:
+                    if pref in m_name and "tts" not in m_name and "image" not in m_name:
+                        return m_name
+            return models[0] if models else None
+    except Exception:
+        return None
+
 async def ask_gemini_ai(session, prompt_text, system_instruction=None):
-    """
-    GEMINI_API_KEY bo'lsa, aiohttp orqali Gemini AI ga murojaat qiladi.
-    """
+    global _WORKING_GEMINI_MODEL
     if not GEMINI_API_KEY:
         return None
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+    # Tekshiriladigan modellar ro'yxati
+    candidates = []
+    if _WORKING_GEMINI_MODEL:
+        candidates.append(_WORKING_GEMINI_MODEL)
+    env_model = os.environ.get("GEMINI_MODEL", "").strip().replace("models/", "")
+    if env_model and env_model not in candidates:
+        candidates.append(env_model)
+    for m in _GEMINI_MODEL_CANDIDATES:
+        if m not in candidates:
+            candidates.append(m)
+
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 350},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
     }
     if system_instruction:
         payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
-    try:
-        async with session.post(url, json=payload, timeout=12) as r:
-            if r.status != 200:
-                logger.warning(f"Gemini API status: {r.status}")
-                return None
-            data = await r.json()
-            candidates = data.get("candidates", [])
-            if not candidates:
-                return None
-            parts = candidates[0].get("content", {}).get("parts", [])
-            text = "".join(p.get("text", "") for p in parts).strip()
-            return text or None
-    except Exception as e:
-        logger.warning(f"Gemini AI xato: {_safe_log_error(e)}")
-        return None
 
-async def generate_ai_signal_review(session, trade, status, confirmations):
-    if not GEMINI_API_KEY:
-        return None
-    sys_prompt = (
-        "Sen professional SMC va ICT oltin (XAUUSD) treyderisan. "
-        "Foydalanuvchi XM brokerda 20$ kichik balans (0.01 lot) bilan savdo qiladi. "
-        "Berilgan signalga 2-3 jumlada juda qisqa, aniq o'zbek tilida xulosa ber: "
-        "kirish qanchalik xavfsiz, likvidlik tuzog'i (inducement) yo'qmi va TP1 da nima qilish kerak."
-    )
-    user_prompt = (
-        f"Signal: {trade['signal']} | Grade: {trade.get('grade')} ({trade.get('score')}/100)\n"
-        f"Entry: {trade['entry']} | SL: {trade['sl']} (Risk: {abs(trade['entry']-trade['sl']):.2f}$) | "
-        f"TP1: {trade['tp1']} | TP2: {trade['tp2']}\n"
-        f"MTF: 5m={status.get('b5')}, 15m={status.get('b15')}, 1H={status.get('b1h')}, 4H={status.get('b4h')}\n"
-        f"EQ(50%): {status.get('eq15')} | PDH/PDL: {status.get('pdh')}/{status.get('pdl')}\n"
-        f"Tasdiqlar: {', '.join(confirmations)}"
-    )
-    return await ask_gemini_ai(session, user_prompt, system_instruction=sys_prompt)
+    for model_name in candidates:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            async with session.post(url, json=payload, timeout=25) as r:
+                if r.status == 404:
+                    logger.warning(f"Gemini model topilmadi (404): {model_name}, keyingisiga o'tilmoqda...")
+                    continue
+                if r.status != 200:
+                    err_txt = await r.text()
+                    logger.warning(f"Gemini API status {r.status} ({model_name}): {_safe_log_error(err_txt[:180])}")
+                    continue
+                data = await r.json()
+                cands = data.get("candidates", [])
+                if not cands:
+                    continue
+                parts = cands[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts if not p.get("thought", False)).strip()
+                if text:
+                    if _WORKING_GEMINI_MODEL != model_name:
+                        _WORKING_GEMINI_MODEL = model_name
+                        logger.info(f"🧠 Gemini AI faol model tanlandi: {model_name}")
+                    return text
+        except Exception as e:
+            logger.warning(f"Gemini AI urinish xatosi ({model_name}): {_safe_log_error(e)}")
+            continue
+
+    # Agar ro'yxatdagi hech biri topilmasa, Google serveridan ro'yxatni so'rab topish
+    discovered = await _discover_available_gemini_model(session)
+    if discovered and discovered not in candidates:
+        _WORKING_GEMINI_MODEL = discovered
+        return await ask_gemini_ai(session, prompt_text, system_instruction)
+
+    return None
 
 # ==================== PURE-PYTHON PNG CHART RENDERER ====================
 _FONT_5X7 = {
@@ -572,24 +614,26 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
         + png_chunk(b"IEND", b"")
     )
 
-# ==================== BYBIT API (Full OHLC XM Offset Sync) ====================
+# ==================== BYBIT API (Dual-Endpoint + XM Offset) ====================
+BYBIT_REST_URLS = [
+    "https://api.bybit.com/v5/market/kline",
+    "https://api.bytick.com/v5/market/kline",
+]
+
 async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
-    """
-    XAUUSDT so'ralganda _CURRENT_OFFSET ni har bir shamning O, H, L, C qiymatlariga
-    qo'shadi — shunda barcha FVG/OB zonalar, EQ va PDH/PDL XM narxiga 100% mos tushadi.
-    """
     imap = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
             "1h": "60", "4h": "240", "1d": "D"}
     interval = imap.get(timeframe, timeframe)
-    url = "https://api.bybit.com/v5/market/kline"
     params = {"category": "linear", "symbol": symbol,
               "interval": interval, "limit": limit}
 
     offset = _CURRENT_OFFSET if symbol == SYMBOL else 0.0
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):
+        url = BYBIT_REST_URLS[attempt % len(BYBIT_REST_URLS)]
         try:
-            async with session.get(url, params=params, headers=HEADERS, timeout=10) as r:
+            timeout = aiohttp.ClientTimeout(total=12, connect=6)
+            async with session.get(url, params=params, headers=HEADERS, timeout=timeout) as r:
                 r.raise_for_status()
                 data = await r.json()
                 rows = data.get("result", {}).get("list", [])
@@ -609,9 +653,8 @@ async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
                 ]
         except Exception as e:
             last_err = e
-            await asyncio.sleep(0.4 * (attempt + 1))
-    raise last_err
-
+            await asyncio.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"Bybit OHLCV timeout ({symbol} {timeframe}): {type(last_err).__name__}")
 # ==================== REAL-TIME WEBSOCKET LOOP ====================
 async def bybit_ws_loop(app):
     """
