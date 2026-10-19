@@ -1,15 +1,13 @@
 """
-GOLD (XAUUSDT) 5m/15m SMC + ICT Bot — v13 INSTITUTIONAL ULTRA
-=============================================================
-Qo'shilgan kuchaytirishlar (v13):
-  ✅ 5m LTF Sniper Trigger (15m POI ichida 5m CHoCH/BOS, 5m FVG yoki Pinbar/Engulfing)
-  ✅ Breaker Blocks (BB) + Fresh FVG + Order Blocks (OB)
-  ✅ ICT OTE (0.618 - 0.786 Fibonacci) + Equilibrium (50% Premium/Discount)
-  ✅ PDH/PDL (Previous Day High/Low) va Asian Session High/Low Sweep tahlili
-  ✅ EQH / EQL (Equal Highs / Equal Lows) likvidlik hovuzlari detektori
-  ✅ 100 Ballik Institutional Scoring Engine (A+, A, B+ setup darajalari)
-  ✅ Built-in PNG Chart Generator (Qo'shimcha kutubxonasiz Telegramga grafik rasm yuboradi)
-  ✅ /chart (🖼 Grafik), /zones, /news, /signal, /stats buyruqlari
+GOLD (XM / XAUUSDT) SMC + ICT Bot — v14 TITANIUM (REAL-TIME WS + GEMINI AI + 20$ SNIPER)
+========================================================================================
+Barcha modullar bitta faylga birlashtirildi:
+  ✅ Real-time Bybit WebSocket (wss://stream.bybit.com/v5/public/linear) + Auto-Reconnect
+  ✅ XM Broker 100% OHLC sinxronizatsiyasi (Default PRICE_OFFSET = -8.21 + /sync buyrug'i)
+  ✅ 20$ Small Account Sniper Mode (15m POI + 5m Tight SL: 1.2$ - 2.6$ risk himoyasi)
+  ✅ Gemini AI Tahlilchi (/ai buyrug'i + har bir signalda AI xulosasi, qo'shimcha kutubxonasiz)
+  ✅ 5m LTF Trigger (CHoCH/BOS, 5m FVG, Pinbar/Engulfing) + Breaker Blocks + OTE + PDH/PDL/Asia Sweep
+  ✅ Ichki PNG Grafik Chizma Dvigateli (/chart va signalda avtomatik rasm)
 """
 
 import asyncio
@@ -41,12 +39,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("gold_smc_bot_v13")
+logger = logging.getLogger("gold_smc_v14")
 
 # ==================== KONFIGURATSIYA ====================
 SYMBOL = "XAUUSDT"
 BTC_SYMBOL = "BTCUSDT"
 EUR_SYMBOL = "EURUSDT"
+BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+
 LIMIT = 240
 HTF_LIMIT = 120
 
@@ -55,9 +55,20 @@ SWING_LEFT, SWING_RIGHT = 3, 3
 CHECK_INTERVAL_SEC = 5
 ZONE_MAX_DISTANCE_PCT = 0.35
 MAX_RISK_PCT = 0.02
-MIN_SIGNAL_SCORE = 55  # 100 ballik tizimda minimal o'tish bali
+MIN_SIGNAL_SCORE = 55
 TRADE_STALE_WARNING_HOURS = 6
 FLIP_WARN_INTERVAL_CHECKS = 10
+
+# 20$ Kichik balans uchun Sniper SL chegaralari (1 unsiya = 0.01 lot XM Standard da $ farqi)
+DEFAULT_BALANCE_USD = 20.0
+DEFAULT_RISK_PER_TRADE_PCT = 10.0  # 20$ balansda ~2.0$ risk
+MAX_RISK_PER_TRADE_PCT = 25.0
+SNIPER_MIN_SL_POINTS = 1.20        # Minimal 1.20$ SL
+SNIPER_MAX_SL_POINTS_SMALL = 2.65  # 20$-50$ balansda maksimal 2.65$ SL (0.01 lotda -2.65$ dan oshmaydi)
+
+# XM Brokerda 0.01 lot Standard = 1 troya unsiya (1$ harakat = 1$ foyda/zarar)
+XM_MIN_LOT = 0.01
+XM_OZ_PER_MIN_LOT = 1.0
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
@@ -67,18 +78,12 @@ except Exception:
     DATA_DIR = BASE_DIR
 DB_FILE = os.path.join(DATA_DIR, "gold_bot.sqlite")
 
-DEFAULT_RISK_PER_TRADE_PCT = 1.0
-MAX_RISK_PER_TRADE_PCT = 5.0
-
-XAUUSD_LOT_UNITS = 1
-MIN_LOT_STEP = 0.01
-
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
 KILLZONES_ENABLED = True
 KILLZONES = [
-    {"name": "London Open", "start": datetime.time(6, 30), "end": datetime.time(11, 0)},
-    {"name": "NY Open / Overlap", "start": datetime.time(12, 0), "end": datetime.time(16, 30)},
+    {"name": "London Open", "start": datetime.time(6, 0), "end": datetime.time(11, 30)},
+    {"name": "NY Open / Overlap", "start": datetime.time(12, 0), "end": datetime.time(17, 0)},
 ]
 SESSION_TZ = {
     "asia": "Asia/Tokyo",
@@ -102,18 +107,23 @@ CHAT_ID = _get_secret("CHAT_ID")
 ADMIN_CHAT_ID = str(CHAT_ID)
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 WEBHOOK_ENABLED = bool(WEBHOOK_SECRET)
-if not WEBHOOK_ENABLED:
-    logger.warning("⚠️ WEBHOOK_SECRET env da yo'q. Webhook endpoint o'chirilgan.")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-PRICE_OFFSET = float(os.environ.get("PRICE_OFFSET", "0.0"))
+# XM va Bybit orasidagi default farq (-8.21)
+DEFAULT_PRICE_OFFSET = float(os.environ.get("PRICE_OFFSET", "-8.21"))
+_CURRENT_OFFSET = DEFAULT_PRICE_OFFSET
+_LIVE_BYBIT_RAW_PRICE = None
+_LIVE_PRICE = None
+_WS_CONNECTED = False
+_LAST_WS_MONITOR_TS = 0.0
 
 # ==================== HELPERS ====================
 def _safe_log_error(error):
     msg = str(error)
-    if BOT_TOKEN:
-        msg = msg.replace(BOT_TOKEN, "***")
-    if WEBHOOK_SECRET:
-        msg = msg.replace(WEBHOOK_SECRET, "***")
+    for sec in (BOT_TOKEN, WEBHOOK_SECRET, GEMINI_API_KEY):
+        if sec:
+            msg = msg.replace(sec, "***")
     return msg
 
 def closed_only(candles):
@@ -252,10 +262,14 @@ _zones_cache = {}
 _swings_cache = {}
 _metrics = {
     "signals": 0, "closed": 0, "wins": 0, "losses": 0,
-    "errors": 0, "tg_errors": 0, "start": time.time(),
+    "errors": 0, "tg_errors": 0, "ws_ticks": 0, "start": time.time(),
 }
 
 O, H, L, C, V = 1, 2, 3, 4, 5
+
+def clear_analysis_caches():
+    _zones_cache.clear()
+    _swings_cache.clear()
 
 # ==================== SUBSCRIBERS / ACCOUNT ====================
 async def get_subs():
@@ -272,10 +286,13 @@ async def remove_sub(chat_id):
     await db.state_set("subscribers", list(s))
 
 async def get_account():
-    return await db.state_get(
+    acc = await db.state_get(
         "account",
-        {"balance": None, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT},
+        {"balance": DEFAULT_BALANCE_USD, "risk_pct": DEFAULT_RISK_PER_TRADE_PCT},
     )
+    if not acc.get("balance"):
+        acc["balance"] = DEFAULT_BALANCE_USD
+    return acc
 
 async def update_account(balance=None, risk=None):
     acc = await get_account()
@@ -299,6 +316,55 @@ async def win_rate_text():
     denom = wins + losses
     wr = (wins / denom * 100) if denom > 0 else 0.0
     return f"WR: {wr:.1f}% ({wins}✅ / {losses}❌ / {be}🛡 | Jami: {total})"
+
+# ==================== GEMINI AI ENGINE (Zero-Dependency) ====================
+async def ask_gemini_ai(session, prompt_text, system_instruction=None):
+    """
+    GEMINI_API_KEY bo'lsa, aiohttp orqali Gemini AI ga murojaat qiladi.
+    """
+    if not GEMINI_API_KEY:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 350},
+    }
+    if system_instruction:
+        payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
+    try:
+        async with session.post(url, json=payload, timeout=12) as r:
+            if r.status != 200:
+                logger.warning(f"Gemini API status: {r.status}")
+                return None
+            data = await r.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return None
+            parts = candidates[0].get("content", {}).get("parts", [])
+            text = "".join(p.get("text", "") for p in parts).strip()
+            return text or None
+    except Exception as e:
+        logger.warning(f"Gemini AI xato: {_safe_log_error(e)}")
+        return None
+
+async def generate_ai_signal_review(session, trade, status, confirmations):
+    if not GEMINI_API_KEY:
+        return None
+    sys_prompt = (
+        "Sen professional SMC va ICT oltin (XAUUSD) treyderisan. "
+        "Foydalanuvchi XM brokerda 20$ kichik balans (0.01 lot) bilan savdo qiladi. "
+        "Berilgan signalga 2-3 jumlada juda qisqa, aniq o'zbek tilida xulosa ber: "
+        "kirish qanchalik xavfsiz, likvidlik tuzog'i (inducement) yo'qmi va TP1 da nima qilish kerak."
+    )
+    user_prompt = (
+        f"Signal: {trade['signal']} | Grade: {trade.get('grade')} ({trade.get('score')}/100)\n"
+        f"Entry: {trade['entry']} | SL: {trade['sl']} (Risk: {abs(trade['entry']-trade['sl']):.2f}$) | "
+        f"TP1: {trade['tp1']} | TP2: {trade['tp2']}\n"
+        f"MTF: 5m={status.get('b5')}, 15m={status.get('b15')}, 1H={status.get('b1h')}, 4H={status.get('b4h')}\n"
+        f"EQ(50%): {status.get('eq15')} | PDH/PDL: {status.get('pdh')}/{status.get('pdl')}\n"
+        f"Tasdiqlar: {', '.join(confirmations)}"
+    )
+    return await ask_gemini_ai(session, user_prompt, system_instruction=sys_prompt)
 
 # ==================== PURE-PYTHON PNG CHART RENDERER ====================
 _FONT_5X7 = {
@@ -352,25 +418,18 @@ _FONT_5X7 = {
 }
 
 def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, height=460):
-    """
-    Hech qanday tashqi kutubxonasiz (faqat built-in zlib/struct)
-    15m SMC/ICT grafikni PNG formatida chizib qaytaradi.
-    """
     window = candles[-65:] if len(candles) >= 65 else candles
     if len(window) < 10:
         return None
 
-    # RGB bufer: fon rangi #12151C (18, 21, 28)
-    bg_r, bg_g, bg_b = 18, 21, 28
+    bg_r, bg_g, bg_b = 16, 19, 26
     row_bytes = width * 3
     buf = bytearray([bg_r, bg_g, bg_b] * (width * height))
 
     def set_px(x, y, c):
         if 0 <= x < width and 0 <= y < height:
             idx = (y * width + x) * 3
-            buf[idx] = c[0]
-            buf[idx + 1] = c[1]
-            buf[idx + 2] = c[2]
+            buf[idx], buf[idx + 1], buf[idx + 2] = c[0], c[1], c[2]
 
     def fill_rect(x0, y0, x1, y1, c, alpha=1.0):
         xa, xb = max(0, min(x0, x1)), min(width - 1, max(x0, x1))
@@ -412,7 +471,6 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
                                 set_px(cx + gx * scale + sx, y + gy * scale + sy, c)
             cx += 6 * scale
 
-    # Narx diapazonini hisoblash
     p_highs = [c[H] for c in window]
     p_lows = [c[L] for c in window]
     if trade:
@@ -424,7 +482,7 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
     p_max += pad
     p_min -= pad
 
-    margin_left, margin_right = 16, 115
+    margin_left, margin_right = 16, 118
     margin_top, margin_bottom = 38, 24
     plot_w = width - margin_left - margin_right
     plot_h = height - margin_top - margin_bottom
@@ -432,14 +490,12 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
     def price_to_y(p):
         return int(margin_top + (p_max - p) / (p_max - p_min) * plot_h)
 
-    # 1. Grid chiziqlari va narx shkalasi
     for i in range(6):
         gp = p_min + (p_max - p_min) * (i / 5.0)
         gy = price_to_y(gp)
         draw_hline(gy, margin_left, width - margin_right, (32, 38, 50), dashed=True)
-        draw_text(width - margin_right + 8, gy - 3, f"{gp:.1f}", (130, 140, 160), scale=1)
+        draw_text(width - margin_right + 8, gy - 3, f"{gp:.2f}", (135, 145, 165), scale=1)
 
-    # 2. Faol SMC Zonalar (FVG / OB / BB)
     start_idx = len(candles) - len(window)
     n_bars = len(window)
     step_x = plot_w / max(n_bars, 1)
@@ -451,22 +507,20 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
         zx1 = int(margin_left + rel_idx * step_x)
         zx2 = width - margin_right
         if z["type"] == "bullish":
-            col = (22, 160, 110) if z["kind"] != "BB" else (50, 130, 220)
+            col = (22, 165, 115) if z["kind"] != "BB" else (55, 135, 225)
         else:
-            col = (210, 60, 75) if z["kind"] != "BB" else (220, 140, 40)
+            col = (215, 60, 75) if z["kind"] != "BB" else (225, 145, 40)
         fill_rect(zx1, zy1, zx2, zy2, col, alpha=0.22)
         draw_hline(zy1, zx1, zx2, col)
         draw_hline(zy2, zx1, zx2, col)
         draw_text(zx2 - 42, min(zy1, zy2) + 3, z["kind"], col, scale=1)
 
-    # 3. Equilibrium (50%) va PDH/PDL
     eq = struct_info.get("eq")
     if eq and p_min <= eq <= p_max:
         eq_y = price_to_y(eq)
-        draw_hline(eq_y, margin_left, width - margin_right, (215, 180, 60), dashed=True)
-        draw_text(margin_left + 4, eq_y - 9, f"EQ 50%: {eq:.1f}", (215, 180, 60), scale=1)
+        draw_hline(eq_y, margin_left, width - margin_right, (220, 185, 65), dashed=True)
+        draw_text(margin_left + 4, eq_y - 9, f"EQ 50%: {eq:.2f}", (220, 185, 65), scale=1)
 
-    # 4. Shamlar (Candlesticks)
     candle_w = max(3, int(step_x * 0.64))
     for i, c in enumerate(window):
         cx = int(margin_left + (i + 0.5) * step_x)
@@ -476,15 +530,12 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
         yc = price_to_y(c[C])
         bull = c[C] >= c[O]
         col = (38, 198, 130) if bull else (234, 75, 90)
-        # Pilik (Wick)
         fill_rect(cx, yh, cx, yl, col)
-        # Tana (Body)
         b_top, b_bot = min(yo, yc), max(yo, yc)
         if b_bot == b_top:
             b_bot += 1
         fill_rect(cx - candle_w // 2, b_top, cx + candle_w // 2, b_bot, col)
 
-    # 5. Bitim darajalari (Entry, SL, TP1, TP2)
     if trade:
         levels = [
             ("ENTRY", trade["entry"], (240, 240, 255)),
@@ -498,16 +549,14 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
                 draw_hline(ly, margin_left, width - margin_right, col, dashed=(lbl != "ENTRY"))
                 draw_text(width - margin_right + 8, ly - 4, f"{lbl}:{val:.1f}", col, scale=1)
 
-    # 6. Sarlavha (Header)
-    last_p = window[-1][C]
+    last_p = _LIVE_PRICE if _LIVE_PRICE else window[-1][C]
     bias_str = (struct_info.get("bias") or "NEUTRAL").upper()
-    hdr = f"GOLD ({SYMBOL}) 15M SMC/ICT | PRICE: {last_p:.2f} | BIAS: {bias_str}"
+    hdr = f"XM GOLD 15M SMC | PRICE: {last_p:.2f} | BIAS: {bias_str}"
     draw_text(margin_left, 12, hdr, (235, 215, 155), scale=2)
 
-    # PNG faylni yig'ish (zlib + struct)
     raw_data = bytearray()
     for y in range(height):
-        raw_data.append(0)  # filter type 0
+        raw_data.append(0)
         raw_data.extend(buf[y * row_bytes:(y + 1) * row_bytes])
 
     def png_chunk(c_type, c_data):
@@ -523,8 +572,12 @@ def render_smc_chart_png(candles, zones, struct_info, trade=None, width=820, hei
         + png_chunk(b"IEND", b"")
     )
 
-# ==================== BYBIT API (Retry + Backoff) ====================
+# ==================== BYBIT API (Full OHLC XM Offset Sync) ====================
 async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
+    """
+    XAUUSDT so'ralganda _CURRENT_OFFSET ni har bir shamning O, H, L, C qiymatlariga
+    qo'shadi — shunda barcha FVG/OB zonalar, EQ va PDH/PDL XM narxiga 100% mos tushadi.
+    """
     imap = {"1m": "1", "5m": "5", "15m": "15", "30m": "30",
             "1h": "60", "4h": "240", "1d": "D"}
     interval = imap.get(timeframe, timeframe)
@@ -532,6 +585,7 @@ async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
     params = {"category": "linear", "symbol": symbol,
               "interval": interval, "limit": limit}
 
+    offset = _CURRENT_OFFSET if symbol == SYMBOL else 0.0
     last_err = None
     for attempt in range(3):
         try:
@@ -542,12 +596,65 @@ async def fetch_ohlcv(session, timeframe, symbol=SYMBOL, limit=LIMIT):
                 if not rows:
                     raise RuntimeError(f"Kline bo'sh: {symbol} {timeframe}")
                 rows.sort(key=lambda x: int(x[0]))
-                return [[int(x[0]), float(x[1]), float(x[2]), float(x[3]),
-                         float(x[4]), float(x[5])] for x in rows]
+                return [
+                    [
+                        int(x[0]),
+                        round(float(x[1]) + offset, 2),
+                        round(float(x[2]) + offset, 2),
+                        round(float(x[3]) + offset, 2),
+                        round(float(x[4]) + offset, 2),
+                        float(x[5]),
+                    ]
+                    for x in rows
+                ]
         except Exception as e:
             last_err = e
             await asyncio.sleep(0.4 * (attempt + 1))
     raise last_err
+
+# ==================== REAL-TIME WEBSOCKET LOOP ====================
+async def bybit_ws_loop(app):
+    """
+    Bybit WebSocket orqali XAUUSDT narxini jonli (real-time, ~0.1s) oladi.
+    Ochiq bitim bo'lsa, darhol monitor_trade() ni ishga tushiradi.
+    """
+    global _LIVE_BYBIT_RAW_PRICE, _LIVE_PRICE, _WS_CONNECTED, _LAST_WS_MONITOR_TS
+    session = app["session"]
+
+    while True:
+        try:
+            async with session.ws_connect(BYBIT_WS_URL, heartbeat=20, timeout=15) as ws:
+                _WS_CONNECTED = True
+                await ws.send_json({"op": "subscribe", "args": [f"tickers.{SYMBOL}"]})
+                logger.info("⚡ Real-time Bybit WebSocket ulandi!")
+
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
+                        data = payload.get("data", {})
+                        last_p_str = data.get("lastPrice")
+                        if last_p_str:
+                            raw_p = float(last_p_str)
+                            _LIVE_BYBIT_RAW_PRICE = raw_p
+                            live_xm = round(raw_p + _CURRENT_OFFSET, 2)
+                            _LIVE_PRICE = live_xm
+                            _metrics["ws_ticks"] += 1
+
+                            now_mono = time.monotonic()
+                            if now_mono - _LAST_WS_MONITOR_TS >= 0.35:
+                                _LAST_WS_MONITOR_TS = now_mono
+                                trade = await db.state_get("current_trade")
+                                if trade:
+                                    b15 = _LAST_STRUCT_15M.get("bias")
+                                    await monitor_trade(session, live_xm, b15)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _WS_CONNECTED = False
+            logger.warning(f"WS uzildi, 3s dan so'ng qayta ulanadi: {_safe_log_error(e)}")
+            await asyncio.sleep(3)
 
 # ==================== ADVANCED SMC & ICT ENGINE ====================
 def find_swings(candles, left=SWING_LEFT, right=SWING_RIGHT):
@@ -578,7 +685,7 @@ def get_swings_cached(candles, cache_key="default", left=SWING_LEFT, right=SWING
     if not candles:
         return [], []
     ts = candles[-1][0]
-    full_key = (cache_key, left, right)
+    full_key = (cache_key, left, right, _CURRENT_OFFSET)
     cached = _swings_cache.get(full_key)
     if cached and cached["ts"] == ts:
         return cached["highs"], cached["lows"]
@@ -587,9 +694,6 @@ def get_swings_cached(candles, cache_key="default", left=SWING_LEFT, right=SWING
     return h, l
 
 def analyze_market_structure(candles, cache_key="default"):
-    """
-    BOS / CHoCH, Dealing Range, Equilibrium (50%) va OTE (61.8% - 78.6%) ni hisoblaydi.
-    """
     highs, lows = get_swings_cached(candles, cache_key=cache_key)
     if len(highs) < 2 or len(lows) < 2:
         return {
@@ -640,7 +744,6 @@ def analyze_market_structure(candles, cache_key="default"):
     rng = max(d_high - d_low, 0.01)
     eq = (d_high + d_low) / 2.0
 
-    # ICT OTE (0.618 - 0.786 retracement)
     if bias == "bullish":
         ote_top = d_high - rng * 0.618
         ote_bottom = d_high - rng * 0.786
@@ -663,7 +766,6 @@ def confirmed_structure_bias(candles, cache_key="default"):
     return analyze_market_structure(candles, cache_key=cache_key)["bias"]
 
 def detect_equal_highs_lows(candles, cache_key="XAU_15m", tol_pct=0.06):
-    """EQH (BSL) va EQL (SSL) likvidlik hovuzlarini topadi."""
     highs, lows = get_swings_cached(candles, cache_key=cache_key)
     eqh, eql = None, None
     if len(highs) >= 2:
@@ -677,10 +779,6 @@ def detect_equal_highs_lows(candles, cache_key="XAU_15m", tol_pct=0.06):
     return eqh, eql
 
 def detect_asia_and_pd_sweeps(candles_15m, pdh, pdl):
-    """
-    1) Kecha kunlik High/Low (PDH/PDL) likvidlik yig'ilishi (Sweep)
-    2) Bugungi Osiyo sessiyasi (00:00 - 07:00 UTC) High/Low va uning Sweep bo'lishi
-    """
     asia_high, asia_low = None, None
     now_date = datetime.datetime.now(datetime.timezone.utc).date()
     asia_bars = []
@@ -732,7 +830,6 @@ def detect_fvg(candles):
     return fvgs
 
 def detect_ob_and_breakers(candles):
-    """Order Blocks (OB) va buzib o'tilgan OB lardan hosil bo'lgan Breaker Blocks (BB)."""
     bodies = [abs(c[C] - c[O]) for c in candles]
     vols = [c[V] if len(c) > 5 else 0 for c in candles]
     raw_obs = []
@@ -779,7 +876,6 @@ def detect_ob_and_breakers(candles):
         if broken_idx is None:
             zones.append(ob)
         else:
-            # OB buzildi -> Breaker Block (BB) ga aylanadi, agar u ham qayta buzilmagan bo'lsa
             bb_type = "bearish" if ob["type"] == "bullish" else "bullish"
             bb_valid = True
             for k in range(broken_idx + 1, check_end):
@@ -815,23 +911,18 @@ def get_active_zones(candles, cache_key="XAU_15m"):
     if not candles:
         return []
     ts = candles[-1][0]
-    cached = _zones_cache.get(cache_key)
+    full_key = (cache_key, _CURRENT_OFFSET)
+    cached = _zones_cache.get(full_key)
     if cached and cached["ts"] == ts:
         return cached["zones"]
 
     fvgs = [z for z in detect_fvg(candles) if _fvg_is_fresh(z, candles)]
     obs_bbs = detect_ob_and_breakers(candles)
     all_fresh = fvgs + obs_bbs
-    _zones_cache[cache_key] = {"ts": ts, "zones": all_fresh}
+    _zones_cache[full_key] = {"ts": ts, "zones": all_fresh}
     return all_fresh
 
 def check_5m_ltf_trigger(cl5, struct5, target_bias):
-    """
-    15m zonaga tegilganda 5 daqiqalik grafikda LTF tasdiqni tekshiradi:
-    1) Yaqinda 5m CHoCH / BOS bo'lgani
-    2) 5m da yangi FVG / OB hosil bo'lgani
-    3) 5m da kuchli Pinbar yoki Engulfing sham
-    """
     triggers = []
     if struct5["bias"] == target_bias:
         ev = struct5.get("event") or ""
@@ -840,7 +931,6 @@ def check_5m_ltf_trigger(cl5, struct5, target_bias):
         elif "BOS" in ev:
             triggers.append("5m BOS")
 
-    # Oxirgi 5 ta 5m sham ichida FVG bormi?
     zones_5m = get_active_zones(cl5, cache_key="XAU_5m")
     recent_5m_zones = [
         z for z in zones_5m
@@ -849,24 +939,22 @@ def check_5m_ltf_trigger(cl5, struct5, target_bias):
     if recent_5m_zones:
         triggers.append(f"5m {recent_5m_zones[-1]['kind']} Displacement")
 
-    # Pinbar / Engulfing tekshiruvi
     if len(cl5) >= 2:
         last, prev = cl5[-1], cl5[-2]
         rng = max(last[H] - last[L], 0.01)
-        body = abs(last[C] - last[O])
         upper_wick = last[H] - max(last[O], last[C])
         lower_wick = min(last[O], last[C]) - last[L]
 
         if target_bias == "bullish":
             if last[C] > last[O] and prev[C] < prev[O] and last[C] > prev[O]:
                 triggers.append("5m Bullish Engulfing")
-            elif lower_wick / rng >= 0.52 and last[C] >= last[O]:
-                triggers.append("5m Bullish Pinbar Rejection")
+            elif lower_wick / rng >= 0.50 and last[C] >= last[O]:
+                triggers.append("5m Bullish Pinbar")
         else:
             if last[C] < last[O] and prev[C] > prev[O] and last[C] < prev[O]:
                 triggers.append("5m Bearish Engulfing")
-            elif upper_wick / rng >= 0.52 and last[C] <= last[O]:
-                triggers.append("5m Bearish Pinbar Rejection")
+            elif upper_wick / rng >= 0.50 and last[C] <= last[O]:
+                triggers.append("5m Bearish Pinbar")
 
     return triggers
 
@@ -911,33 +999,22 @@ def calculate_vwap(candles, lookback=48):
         cv += v
     return cpv / cv if cv > 0 else None
 
-async def adaptive_risk_pct(base_risk, grade="A"):
-    results = await db.get_all_results()
-    mult = 1.15 if grade == "A+" else (1.0 if grade == "A" else 0.85)
-    if len(results) >= 8:
-        recent = results[-20:]
-        wins = sum(1 for r in recent if _is_win_result(r))
-        losses = sum(1 for r in recent if r == "SL")
-        denom = wins + losses
-        if denom >= 6:
-            wr = wins / denom
-            if wr >= 0.65:
-                mult *= 1.2
-            elif wr <= 0.38:
-                mult *= 0.65
-    return round(min(max(base_risk * mult, 0.2), MAX_RISK_PER_TRADE_PCT), 2)
-
-def build_trade(candles, struct_info, price, atr):
-    bias = struct_info["bias"]
-    all_zones = [
-        z for z in get_active_zones(candles, "XAU_15m")
+# ==================== 20$ SNIPER TRADE BUILDER ====================
+def build_sniper_trade(cl15, cl5, struct15, price, atr15, balance):
+    """
+    15m POI ichida 5m LTF sham/zona yordamida 20$ balansga mos
+    (1.20$ - 2.65$ SL) snayper bitim quradi.
+    """
+    bias = struct15["bias"]
+    all_zones_15m = [
+        z for z in get_active_zones(cl15, "XAU_15m")
         if z["type"] == bias
     ]
-    if not all_zones:
+    if not all_zones_15m:
         return None
 
-    all_zones.sort(key=lambda z: abs(price - z["ce"]))
-    zone = all_zones[0]
+    all_zones_15m.sort(key=lambda z: abs(price - z["ce"]))
+    zone = all_zones_15m[0]
     lower = min(zone["bottom"], zone["top"])
     upper = max(zone["bottom"], zone["top"])
     tol = price * (ZONE_MAX_DISTANCE_PCT / 100.0)
@@ -948,19 +1025,23 @@ def build_trade(candles, struct_info, price, atr):
         other["kind"] != zone["kind"]
         and other["bottom"] <= zone["top"]
         and other["top"] >= zone["bottom"]
-        for other in all_zones
+        for other in all_zones_15m
     )
 
-    min_sl_dist = (atr * 0.65) if atr else (price * 0.0015)
-    max_sl_dist = (atr * 2.8) if atr else (price * MAX_RISK_PCT)
-    sl_buf = (atr * 0.20) if atr else (price * 0.001)
+    is_small_acc = (balance or DEFAULT_BALANCE_USD) <= 60.0
+    max_sl_pts = SNIPER_MAX_SL_POINTS_SMALL if is_small_acc else (atr15 * 2.5 if atr15 else 6.0)
+    min_sl_pts = SNIPER_MIN_SL_POINTS
+
+    # 5m oxirgi 4 ta shamning ekstremumi orqali tor Sniper SL topish
+    recent_5m_low = min(c[L] for c in cl5[-4:]) if len(cl5) >= 4 else zone["bottom"]
+    recent_5m_high = max(c[H] for c in cl5[-4:]) if len(cl5) >= 4 else zone["top"]
     entry = round(price, 2)
 
     if bias == "bullish":
-        raw_sl = zone["bottom"] - sl_buf
-        risk = max(entry - raw_sl, min_sl_dist)
-        if risk <= 0 or risk > max_sl_dist or risk > entry * MAX_RISK_PCT:
-            return None
+        # 5m swing low yoki 15m zona osti + 0.25$ bufer
+        candidate_sl = max(zone["bottom"] - 0.30, recent_5m_low - 0.25)
+        raw_risk = entry - candidate_sl
+        risk = min(max(raw_risk, min_sl_pts), max_sl_pts)
         sl = round(entry - risk, 2)
         return {
             "signal": "LONG", "bias": bias,
@@ -970,14 +1051,14 @@ def build_trade(candles, struct_info, price, atr):
             "tp2": round(entry + risk * RR2, 2),
             "tp3": round(entry + risk * RR3, 2),
             "confluence": confluence,
+            "sniper_mode": is_small_acc,
             "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "breakeven": False, "tp1_notified": False, "stale_warned": False,
         }
     else:
-        raw_sl = zone["top"] + sl_buf
-        risk = max(raw_sl - entry, min_sl_dist)
-        if risk <= 0 or risk > max_sl_dist or risk > entry * MAX_RISK_PCT:
-            return None
+        candidate_sl = min(zone["top"] + 0.30, recent_5m_high + 0.25)
+        raw_risk = candidate_sl - entry
+        risk = min(max(raw_risk, min_sl_pts), max_sl_pts)
         sl = round(entry + risk, 2)
         return {
             "signal": "SHORT", "bias": bias,
@@ -987,19 +1068,27 @@ def build_trade(candles, struct_info, price, atr):
             "tp2": round(entry - risk * RR2, 2),
             "tp3": round(entry - risk * RR3, 2),
             "confluence": confluence,
+            "sniper_mode": is_small_acc,
             "opened_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "breakeven": False, "tp1_notified": False, "stale_warned": False,
         }
 
-def calc_lot(entry, sl, balance, risk_pct):
-    if not balance or balance <= 0:
-        return None
-    r_usd = balance * (risk_pct / 100.0)
-    p_risk = abs(entry - sl)
-    if p_risk <= 0:
-        return None
-    lot = math.floor((r_usd / (p_risk * XAUUSD_LOT_UNITS)) / MIN_LOT_STEP + 1e-9) * MIN_LOT_STEP
-    return round(max(lot, MIN_LOT_STEP), 2)
+def calc_xm_lot_and_risk(entry, sl, balance, risk_pct):
+    """
+    XM Standard/Ultra Low hisobi uchun:
+    0.01 lot = 1 troya unsiya (1$ harakat = 1$ PnL).
+    """
+    bal = balance or DEFAULT_BALANCE_USD
+    sl_dist = abs(entry - sl)
+    if sl_dist <= 0:
+        return XM_MIN_LOT, 0.0
+
+    target_risk_usd = bal * (risk_pct / 100.0)
+    raw_lots = (target_risk_usd / sl_dist) * XM_MIN_LOT
+    lot = max(XM_MIN_LOT, math.floor(raw_lots / XM_MIN_LOT + 1e-9) * XM_MIN_LOT)
+    lot = round(lot, 2)
+    actual_risk_usd = round((lot / XM_MIN_LOT) * sl_dist * XM_OZ_PER_MIN_LOT, 2)
+    return lot, actual_risk_usd
 
 # ==================== TELEGRAM (Text + Photo) ====================
 async def send_telegram(session, text, with_keyboard=False, chat_id=None, parse_mode="HTML"):
@@ -1008,9 +1097,8 @@ async def send_telegram(session, text, with_keyboard=False, chat_id=None, parse_
         return
     markup = json.dumps({
         "keyboard": [
-            ["📊 Signal", "🖼 Grafik"],
-            ["🎯 Zonalar", "📰 Yangiliklar"],
-            ["📈 Statistika"],
+            ["📊 Signal", "🖼 Grafik", "🧠 AI Tahlil"],
+            ["🎯 Zonalar", "📰 Yangiliklar", "📈 Statistika"],
         ],
         "resize_keyboard": True,
     }) if with_keyboard else None
@@ -1052,7 +1140,7 @@ async def send_telegram_photo(session, png_bytes, caption="", chat_id=None):
                 form.add_field("chat_id", str(target))
                 form.add_field("caption", caption[:1024])
                 form.add_field("parse_mode", "HTML")
-                form.add_field("photo", png_bytes, filename="gold_smc_v13.png", content_type="image/png")
+                form.add_field("photo", png_bytes, filename="xm_gold_smc.png", content_type="image/png")
                 async with session.post(url, data=form, timeout=15) as r:
                     if r.status == 200:
                         break
@@ -1067,13 +1155,13 @@ async def send_telegram_photo(session, png_bytes, caption="", chat_id=None):
         await asyncio.sleep(0.05)
 
 # ==================== TRADING MANAGEMENT ====================
+_monitor_lock = asyncio.Lock()
+
 async def close_trade(session, trade, result, price):
     await db.state_set("current_trade", None)
     acc = await get_account()
-    adj_risk = await adaptive_risk_pct(acc["risk_pct"], trade.get("grade", "A"))
     init_sl = trade.get("initial_sl", trade["sl"])
-    lot = calc_lot(trade["entry"], init_sl, acc["balance"], adj_risk) if acc["balance"] else None
-    usd_risk = round(lot * abs(trade["entry"] - init_sl) * XAUUSD_LOT_UNITS, 2) if lot else None
+    lot, usd_risk = calc_xm_lot_and_risk(trade["entry"], init_sl, acc["balance"], acc["risk_pct"])
 
     await db.insert_trade(trade, result, price, lot, usd_risk, trade.get("confirmations", ""))
     _metrics["closed"] += 1
@@ -1082,6 +1170,9 @@ async def close_trade(session, trade, result, price):
     elif result == "SL":
         _metrics["losses"] += 1
 
+    pnl_pts = (price - trade["entry"]) if trade["signal"] == "LONG" else (trade["entry"] - price)
+    pnl_usd = round((lot / XM_MIN_LOT) * pnl_pts, 2)
+
     emoji = {
         "TP2": "✅🏆", "TP3": "🚀👑", "TP1 + Trailing SL": "✅🛡",
         "SL": "❌", "BE": "➖", "MANUAL": "🛑",
@@ -1089,83 +1180,74 @@ async def close_trade(session, trade, result, price):
     stat = await win_rate_text()
     await send_telegram(
         session,
-        f"<b>GOLD {trade['signal']} YOPILDI</b> {emoji}\n"
-        f"Natija: <b>{html.escape(result)}</b> | Yopilish narxi: <code>{price}</code>\n"
+        f"<b>XM GOLD {trade['signal']} YOPILDI</b> {emoji}\n"
+        f"Natija: <b>{html.escape(result)}</b> | Narx: <code>{price}</code>\n"
+        f"💰 <b>Natija ({lot} lot):</b> <code>{pnl_usd:+.2f}$</code>\n"
         f"📊 {html.escape(stat)}",
     )
 
 async def monitor_trade(session, price, bias15):
-    trade = await db.state_get("current_trade")
-    if not trade:
+    if _monitor_lock.locked():
         return
+    async with _monitor_lock:
+        trade = await db.state_get("current_trade")
+        if not trade:
+            return
 
-    side = trade["signal"]
-    entry = trade["entry"]
-    tp1 = trade["tp1"]
-    tp2 = trade["tp2"]
-    notes = []
-    to_close = None
+        side = trade["signal"]
+        entry = trade["entry"]
+        tp1 = trade["tp1"]
+        tp2 = trade["tp2"]
+        notes = []
+        to_close = None
 
-    tp1_hit = (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
-    if tp1_hit and not trade.get("tp1_notified"):
-        trade["tp1_notified"] = True
-        trade["breakeven"] = True
-        be_lock = abs(tp1 - entry) * 0.20
-        new_sl = round(entry + be_lock, 2) if side == "LONG" else round(entry - be_lock, 2)
-        if (side == "LONG" and new_sl > trade["sl"]) or (side == "SHORT" and new_sl < trade["sl"]):
-            trade["sl"] = new_sl
-        notes.append(
-            f"🎯 <b>TP1 OLINDI ({tp1})!</b>\n"
-            f"🛡 SL foydaga ko'chirildi (BE+): <code>{trade['sl']}</code>"
-        )
+        tp1_hit = (side == "LONG" and price >= tp1) or (side == "SHORT" and price <= tp1)
+        if tp1_hit and not trade.get("tp1_notified"):
+            trade["tp1_notified"] = True
+            trade["breakeven"] = True
+            be_lock = max(abs(tp1 - entry) * 0.25, 0.30)
+            new_sl = round(entry + be_lock, 2) if side == "LONG" else round(entry - be_lock, 2)
+            if (side == "LONG" and new_sl > trade["sl"]) or (side == "SHORT" and new_sl < trade["sl"]):
+                trade["sl"] = new_sl
+            notes.append(
+                f"🎯 <b>TP1 OLINDI ({tp1})!</b>\n"
+                f"🛡 SL xavfsiz foydaga tortildi (BE+): <code>{trade['sl']}</code>\n"
+                f"💡 <i>20$ balans tavsiyasi: bitimning 50% qismini yopib, qolganini TP2 ga ushlang!</i>"
+            )
 
-    if trade.get("tp1_notified"):
-        if side == "LONG" and price > tp1:
-            trail_sl = round(entry + (price - entry) * 0.55, 2)
-            if trail_sl > trade["sl"] + 0.5:
-                trade["sl"] = trail_sl
-                notes.append(f"🔥 <b>LONG Trailing SL:</b> <code>{trade['sl']}</code>")
-        elif side == "SHORT" and price < tp1:
-            trail_sl = round(entry - (entry - price) * 0.55, 2)
-            if trail_sl < trade["sl"] - 0.5:
-                trade["sl"] = trail_sl
-                notes.append(f"🔥 <b>SHORT Trailing SL:</b> <code>{trade['sl']}</code>")
+        if trade.get("tp1_notified"):
+            if side == "LONG" and price > tp1:
+                trail_sl = round(entry + (price - entry) * 0.55, 2)
+                if trail_sl > trade["sl"] + 0.35:
+                    trade["sl"] = trail_sl
+                    notes.append(f"🔥 <b>LONG Real-time Trailing SL:</b> <code>{trade['sl']}</code>")
+            elif side == "SHORT" and price < tp1:
+                trail_sl = round(entry - (entry - price) * 0.55, 2)
+                if trail_sl < trade["sl"] - 0.35:
+                    trade["sl"] = trail_sl
+                    notes.append(f"🔥 <b>SHORT Real-time Trailing SL:</b> <code>{trade['sl']}</code>")
 
-    opened_str = trade.get("opened_at")
-    if opened_str and not trade.get("stale_warned"):
-        try:
-            opened_dt = datetime.datetime.fromisoformat(opened_str)
-            age_hours = (datetime.datetime.now(datetime.timezone.utc) - opened_dt).total_seconds() / 3600.0
-            if age_hours >= TRADE_STALE_WARNING_HOURS:
-                trade["stale_warned"] = True
-                notes.append(
-                    f"⏳ <b>Eslatma:</b> {side} bitim {TRADE_STALE_WARNING_HOURS} soatdan beri ochiq "
-                    f"(Narx: <code>{price}</code>)."
-                )
-        except Exception:
-            pass
+        sl_hit = (side == "LONG" and price <= trade["sl"]) or (side == "SHORT" and price >= trade["sl"])
+        tp2_hit = (side == "LONG" and price >= tp2) or (side == "SHORT" and price <= tp2)
 
-    sl_hit = (side == "LONG" and price <= trade["sl"]) or (side == "SHORT" and price >= trade["sl"])
-    tp2_hit = (side == "LONG" and price >= tp2) or (side == "SHORT" and price <= tp2)
+        if sl_hit:
+            res_label = "TP1 + Trailing SL" if trade.get("tp1_notified") else ("BE" if trade.get("breakeven") else "SL")
+            to_close = (res_label, price)
+        elif tp2_hit:
+            to_close = ("TP2", price)
+        elif bias15 is not None and bias15 != trade["bias"]:
+            counter = (await db.state_get("flip_counter", 0)) + 1
+            await db.state_set("flip_counter", counter)
+            if counter >= FLIP_WARN_INTERVAL_CHECKS:
+                notes.append(f"⚠️ <b>Diqqat:</b> {side} ochiq, lekin 15m struktura <b>{bias15.upper()}</b> ga o'zgardi!")
+                await db.state_set("flip_counter", 0)
 
-    if sl_hit:
-        res_label = "TP1 + Trailing SL" if trade.get("tp1_notified") else ("BE" if trade.get("breakeven") else "SL")
-        to_close = (res_label, price)
-    elif tp2_hit:
-        to_close = ("TP2", price)
-    elif bias15 is not None and bias15 != trade["bias"]:
-        counter = (await db.state_get("flip_counter", 0)) + 1
-        await db.state_set("flip_counter", counter)
-        if counter >= FLIP_WARN_INTERVAL_CHECKS:
-            notes.append(f"⚠️ <b>Diqqat:</b> {side} ochiq, lekin 15m struktura <b>{bias15.upper()}</b> ga o'zgardi!")
+        await db.state_set("current_trade", trade)
+        for n in notes:
+            await send_telegram(session, n)
+        if to_close:
+            await close_trade(session, trade, *to_close)
             await db.state_set("flip_counter", 0)
-
-    await db.state_set("current_trade", trade)
-    for n in notes:
-        await send_telegram(session, n)
-    if to_close:
-        await close_trade(session, trade, *to_close)
-        await db.state_set("flip_counter", 0)
 
 # ==================== NEWS ====================
 _news_cache = {"events": None, "fetched_at": None}
@@ -1216,9 +1298,9 @@ async def fetch_htf_context(session):
     c_time = time.monotonic()
     cache = await db.state_get(
         "htf_cache",
-        {"b1h": None, "b4h": None, "b1d": None, "pdh": None, "pdl": None, "ts": 0},
+        {"b1h": None, "b4h": None, "b1d": None, "pdh": None, "pdl": None, "ts": 0, "offset": None},
     )
-    if c_time - cache.get("ts", 0) < 60:
+    if c_time - cache.get("ts", 0) < 60 and cache.get("offset") == _CURRENT_OFFSET:
         return cache
 
     tasks = [
@@ -1244,7 +1326,10 @@ async def fetch_htf_context(session):
         pdh = round(prev_day[H], 2)
         pdl = round(prev_day[L], 2)
 
-    data = {"b1h": b1h, "b4h": b4h, "b1d": b1d, "pdh": pdh, "pdl": pdl, "ts": c_time}
+    data = {
+        "b1h": b1h, "b4h": b4h, "b1d": b1d,
+        "pdh": pdh, "pdl": pdl, "ts": c_time, "offset": _CURRENT_OFFSET,
+    }
     await db.state_set("htf_cache", data)
     return data
 
@@ -1382,9 +1467,6 @@ def evaluate_institutional_score(
     btc_bias, eur_bias, smt_eur, smt_btc, zone_confluence, sweep15,
     pd_asia_info, eqh, eql, delta, vp, session_name
 ):
-    """
-    100 ballik SMC/ICT baholash tizimi.
-    """
     bias = struct15["bias"]
     eq = struct15.get("eq")
     ote_top = struct15.get("ote_top")
@@ -1394,23 +1476,20 @@ def evaluate_institutional_score(
     score = 0
     confs = []
 
-    # 1. 5m LTF Trigger (20 ball)
     if ltf_triggers:
         score += 20
         confs.append(" + ".join(ltf_triggers[:2]))
 
-    # 2. MTF Alignment (15 ball)
     if mtf_score >= 3:
         score += 15
-        confs.append("MTF 3/3 (Full Alignment)")
+        confs.append("MTF 3/3 (Full)")
     elif mtf_score == 2:
         score += 10
         confs.append("MTF 2/3")
 
-    # 3. Dealing Range: OTE & Discount/Premium (15 ball)
     if ote_bot and ote_top and ote_bot <= price <= ote_top:
         score += 15
-        confs.append("ICT OTE Zona (0.618-0.786)")
+        confs.append("ICT OTE (0.618-0.786)")
     elif bias == "bullish" and eq and price <= eq:
         score += 10
         confs.append("ICT Discount (<50% EQ)")
@@ -1418,29 +1497,27 @@ def evaluate_institutional_score(
         score += 10
         confs.append("ICT Premium (>50% EQ)")
 
-    # 4. Liquidity Sweep: PDH/PDL, Asia Range yoki Swing Sweep (15 ball)
     if bias == "bullish":
         if pd_asia_info.get("bull_sweep"):
             score += 15
             confs.append(pd_asia_info["bull_sweep"])
         elif sweep15 == "bullish_sweep":
             score += 12
-            confs.append("15m SSL Liquidity Sweep")
+            confs.append("15m SSL Sweep")
         if eqh and eqh > price:
             score += 5
-            confs.append(f"Target BSL Pool (EQH @ {eqh})")
+            confs.append(f"Target BSL (EQH @ {eqh})")
     else:
         if pd_asia_info.get("bear_sweep"):
             score += 15
             confs.append(pd_asia_info["bear_sweep"])
         elif sweep15 == "bearish_sweep":
             score += 12
-            confs.append("15m BSL Liquidity Sweep")
+            confs.append("15m BSL Sweep")
         if eql and eql < price:
             score += 5
-            confs.append(f"Target SSL Pool (EQL @ {eql})")
+            confs.append(f"Target SSL (EQL @ {eql})")
 
-    # 5. Zone Confluence & Structure Event (12 ball)
     if zone_confluence:
         score += 8
         confs.append("FVG + OB/BB Confluence")
@@ -1448,27 +1525,25 @@ def evaluate_institutional_score(
         score += 5
         confs.append(f"15m {event}")
 
-    # 6. SMT Divergence & Korrelyatsiya (10 ball)
     if bias == "bullish":
         if smt_eur == "bullish" or smt_btc == "bullish":
             score += 10
             confs.append("ICT SMT Divergence (Bullish)")
         elif btc_bias == "bullish" and eur_bias == "bullish":
             score += 6
-            confs.append("Korrelyatsiya: BTC+EUR Bullish")
+            confs.append("SMT: BTC+EUR Bullish")
     else:
         if smt_eur == "bearish" or smt_btc == "bearish":
             score += 10
             confs.append("ICT SMT Divergence (Bearish)")
         elif btc_bias == "bearish" and eur_bias == "bearish":
             score += 6
-            confs.append("Korrelyatsiya: BTC+EUR Bearish")
+            confs.append("SMT: BTC+EUR Bearish")
 
-    # 7. Order Flow, VWAP, RSI, VP va Killzone (13 ball)
     if bias == "bullish":
         if bull_div:
             score += 6
-            confs.append("RSI Bullish Divergence")
+            confs.append("RSI Bullish Div")
         if vwap and price > vwap:
             score += 4
             confs.append("VWAP ustida")
@@ -1481,7 +1556,7 @@ def evaluate_institutional_score(
     else:
         if bear_div:
             score += 6
-            confs.append("RSI Bearish Divergence")
+            confs.append("RSI Bearish Div")
         if vwap and price < vwap:
             score += 4
             confs.append("VWAP ostida")
@@ -1502,7 +1577,7 @@ def evaluate_institutional_score(
 
 # ==================== MAIN CYCLE ====================
 async def run_bot_cycle(session):
-    global _LAST_CANDLES_15M, _LAST_STRUCT_15M
+    global _LAST_CANDLES_15M, _LAST_STRUCT_15M, _LIVE_BYBIT_RAW_PRICE, _LIVE_PRICE
     try:
         c15, c5 = await asyncio.gather(
             fetch_ohlcv(session, "15m"),
@@ -1514,7 +1589,12 @@ async def run_bot_cycle(session):
 
         cl15 = closed_only(c15)
         cl5 = closed_only(c5)
-        price = round(c15[-1][C] + PRICE_OFFSET, 2)
+
+        # Agar WebSocket ishlayotgan bo'lsa jonli narxni olamiz, aks holda REST narxini
+        rest_xm_price = round(c15[-1][C], 2)
+        if _LIVE_BYBIT_RAW_PRICE is None:
+            _LIVE_BYBIT_RAW_PRICE = round(rest_xm_price - _CURRENT_OFFSET, 2)
+        price = _LIVE_PRICE if (_WS_CONNECTED and _LIVE_PRICE) else rest_xm_price
 
         struct15 = analyze_market_structure(cl15, cache_key="XAU_15m")
         struct5 = analyze_market_structure(cl5, cache_key="XAU_5m")
@@ -1539,11 +1619,12 @@ async def run_bot_cycle(session):
             "eqh": eqh, "eql": eql,
             "event15": struct15.get("event"),
             "atr15": round(atr15, 2) if atr15 else None,
+            "offset": _CURRENT_OFFSET,
+            "ws": _WS_CONNECTED,
             "time": time.strftime("%H:%M:%S"),
         }
         await db.state_set("last_status", status)
 
-        # 5m Impuls detektori
         impulse = detect_impulse(cl5)
         if impulse:
             last_ts = await db.state_get("last_impulse_ts")
@@ -1551,11 +1632,10 @@ async def run_bot_cycle(session):
                 await db.state_set("last_impulse_ts", impulse["ts"])
                 await send_telegram(
                     session,
-                    f"⚡ <b>IMPULS (5m):</b> {impulse['direction']} <code>{impulse['range']}$</code> "
+                    f"⚡ <b>XM GOLD IMPULS (5m):</b> {impulse['direction']} <code>{impulse['range']}$</code> "
                     f"({impulse['ratio']}x) | Narx: <code>{impulse['price']}</code>",
                 )
 
-        # Ochiq bitim monitoringi
         trade = await db.state_get("current_trade")
         if trade:
             await monitor_trade(session, price, b15)
@@ -1573,21 +1653,18 @@ async def run_bot_cycle(session):
 
         if not b15:
             return
-        # HTF qarama-qarshilik filtri
         if b1h and b4h and b1h != b15 and b4h != b15:
             return
 
-        # 1. 15m POI (FVG / OB / Breaker) tekshiruvi
-        new_trade = build_trade(cl15, struct15, price, atr15)
+        acc = await get_account()
+        new_trade = build_sniper_trade(cl15, cl5, struct15, price, atr15, acc["balance"])
         if not new_trade:
             return
 
-        # 2. 5m LTF Snayper Tasdig'i (5m CHoCH/BOS, 5m FVG yoki 5m Rejection)
         ltf_triggers = check_5m_ltf_trigger(cl5, struct5, b15)
         if not ltf_triggers:
             return
 
-        # 3. Chuqur tahlil va Parallel SMT
         rsis15 = calculate_rsi(cl15)
         vwap15 = calculate_vwap(cl15)
         bull_div, bear_div = detect_rsi_divergence(cl15, rsis15)
@@ -1619,44 +1696,48 @@ async def run_bot_cycle(session):
         if score < MIN_SIGNAL_SCORE:
             return
 
-        acc = await get_account()
-        adj_risk = await adaptive_risk_pct(acc["risk_pct"], grade=grade)
-        lot = calc_lot(new_trade["entry"], new_trade["sl"], acc["balance"], adj_risk) if acc["balance"] else None
+        lot, risk_usd = calc_xm_lot_and_risk(
+            new_trade["entry"], new_trade["sl"], acc["balance"], acc["risk_pct"]
+        )
+        tp1_usd = round(risk_usd * RR1, 2)
+        tp2_usd = round(risk_usd * RR2, 2)
 
         new_trade["score"] = score
         new_trade["grade"] = grade
         new_trade["confirmations"] = ", ".join(confirmations)
 
+        # Gemini AI tahlili (agar GEMINI_API_KEY kiritilgan bo'lsa)
+        ai_comment = await generate_ai_signal_review(session, new_trade, status, confirmations)
+        ai_block = f"\n🧠 <b>Gemini AI Xulosasi:</b>\n<i>{html.escape(ai_comment)}</i>\n" if ai_comment else ""
+
         dir_emoji = "🟢 LONG (BUY)" if new_trade["signal"] == "LONG" else "🔴 SHORT (SELL)"
         msg = (
-            f"🎯 <b>GOLD ({SYMBOL}) — {dir_emoji}</b>\n"
-            f"⭐️ <b>Setup Darajasi:</b> <code>{grade} ({score}/100 ball)</code>\n"
+            f"🎯 <b>XM GOLD — {dir_emoji}</b>\n"
+            f"⭐️ <b>Sifat:</b> <code>{grade} ({score}/100)</code> | {'⚡ 20$ Sniper SL' if new_trade.get('sniper_mode') else 'Standart'}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📌 <b>Kirish (Entry):</b> <code>{new_trade['entry']}</code> (15m {new_trade['zone_kind']})\n"
             f"⚡ <b>5m Trigger:</b> <code>{html.escape(', '.join(ltf_triggers))}</code>\n"
-            f"🛑 <b>Stop Loss:</b> <code>{new_trade['sl']}</code>\n"
-            f"🎯 <b>TP1 (1.5R):</b> <code>{new_trade['tp1']}</code>\n"
-            f"🎯 <b>TP2 (3.0R):</b> <code>{new_trade['tp2']}</code>\n"
+            f"🛑 <b>Stop Loss:</b> <code>{new_trade['sl']}</code> (<code>-{risk_usd}$</code>)\n"
+            f"🎯 <b>TP1 (1.5R):</b> <code>{new_trade['tp1']}</code> (<code>+{tp1_usd}$</code>)\n"
+            f"🎯 <b>TP2 (3.0R):</b> <code>{new_trade['tp2']}</code> (<code>+{tp2_usd}$</code>)\n"
             f"🚀 <b>TP3 (4.5R):</b> <code>{new_trade['tp3']}</code>\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"🧭 <b>MTF:</b> 5m={b5 or '-'} | 15m={b15.upper()} | 1H={b1h or '-'} | 4H={b4h or '-'} | 1D={b1d or '-'}\n"
+            f"💼 <b>XM Tavsiya Lot:</b> <code>{lot} lot</code> (Balans: ${acc['balance']})\n"
+            f"🧭 <b>MTF:</b> 5m={b5 or '-'} | 15m={b15.upper()} | 1H={b1h or '-'} | 4H={b4h or '-'}\n"
             f"⚖️ <b>EQ (50%):</b> <code>{struct15.get('eq')}</code> | <b>OTE:</b> <code>{struct15.get('ote_bottom')}-{struct15.get('ote_top')}</code>\n"
             f"🏛 <b>PDH/PDL:</b> <code>{pdh or '-'} / {pdl or '-'}</code> | <b>Asia:</b> <code>{pd_asia['asia_high'] or '-'} / {pd_asia['asia_low'] or '-'}</code>\n"
-            f"📊 <b>VP:</b> POC=<code>{vp15['poc'] if vp15 else '-'}</code> | VAH=<code>{vp15['vah'] if vp15 else '-'}</code> | VAL=<code>{vp15['val'] if vp15 else '-'}</code>\n"
-            f"✅ <b>Tasdiqlar:</b> {html.escape(', '.join(confirmations))}\n"
-            f"💼 <b>Tavsiya Lot:</b> <code>{lot or 'Balans kiritilmagan (/balance)'}</code> (Risk: {adj_risk}%)\n"
-            f"🏆 <b>{html.escape(await win_rate_text())}</b>"
+            f"✅ <b>Tasdiqlar:</b> {html.escape(', '.join(confirmations))}"
+            f"{ai_block}"
         )
         logger.info(f"YANGI SIGNAL [{grade} {score}/100]: {new_trade['signal']} @ {new_trade['entry']}")
         await db.state_set("current_trade", new_trade)
         _metrics["signals"] += 1
         await send_telegram(session, msg)
 
-        # Grafik rasm chizib Telegramga yuborish
         zones_15m = get_active_zones(cl15, "XAU_15m")
         png_bytes = render_smc_chart_png(cl15, zones_15m, struct15, trade=new_trade)
         if png_bytes:
-            caption = f"🖼 <b>{SYMBOL} 15m SMC Chart</b> — {new_trade['signal']} ({grade} | {score}/100)"
+            caption = f"🖼 <b>XM GOLD 15m SMC Chart</b> — {new_trade['signal']} ({grade} | {score}/100)"
             await send_telegram_photo(session, png_bytes, caption=caption)
 
     except Exception as e:
@@ -1671,19 +1752,24 @@ async def build_status_text():
         return "⏳ Bot hali birinchi bozor tekshiruvini bajarmadi."
     paused = await db.state_get("paused", False)
     t = await db.state_get("current_trade")
+    acc = await get_account()
+    live_p = _LIVE_PRICE if (_WS_CONNECTED and _LIVE_PRICE) else s["price"]
+    ws_badge = "⚡ WS Real-Time" if _WS_CONNECTED else "🔄 REST (5s)"
+
     lines = [
-        f"🤖 <b>GOLD SMC v13 ULTRA</b> — {'⏸ PAUZADA' if paused else '🟢 ISHLAMOQDA'}",
-        f"🕒 Vaqt: <code>{s.get('time')}</code> | Sessiya: <b>{current_session()}</b>",
-        f"💰 <b>Joriy narx:</b> <code>{s['price']}</code> (ATR: <code>{s.get('atr15') or '-'}</code>)",
+        f"🤖 <b>XM GOLD SMC v14 TITANIUM</b> — {'⏸ PAUZADA' if paused else '🟢 FAOL'}",
+        f"📡 Aloqa: <b>{ws_badge}</b> | Offset: <code>{_CURRENT_OFFSET:+.2f}$</code>",
+        f"💰 <b>XM Narx:</b> <code>{live_p:.2f}</code> (ATR: <code>{s.get('atr15') or '-'}</code>)",
         f"📐 <b>15m EQ (50%):</b> <code>{s.get('eq15') or '-'}</code> | <b>OTE:</b> <code>{s.get('ote_bottom') or '-'}-{s.get('ote_top') or '-'}</code>",
         f"🏛 <b>PDH / PDL:</b> <code>{s.get('pdh') or '-'} / {s.get('pdl') or '-'}</code>",
         f"🌏 <b>Asia H / L:</b> <code>{s.get('asia_high') or '-'} / {s.get('asia_low') or '-'}</code>",
-        f"💧 <b>Liquidity Pools:</b> EQH=<code>{s.get('eqh') or '-'}</code> | EQL=<code>{s.get('eql') or '-'}</code>",
+        f"💧 <b>Pools:</b> EQH=<code>{s.get('eqh') or '-'}</code> | EQL=<code>{s.get('eql') or '-'}</code>",
         f"📈 <b>LTF:</b> 5m={s.get('b5') or '-'} | 15m={s.get('b15') or '-'} ({s.get('event15') or '-'})",
         f"🏛 <b>HTF:</b> 1H={s.get('b1h') or '-'} | 4H={s.get('b4h') or '-'} | 1D={s.get('b1d') or '-'}",
+        f"💼 <b>Hisob:</b> <code>${acc['balance']}</code> (Sniper Risk: <code>{acc['risk_pct']}%</code>)",
     ]
     if t:
-        pnl_pts = round((s["price"] - t["entry"]) if t["signal"] == "LONG" else (t["entry"] - s["price"]), 2)
+        pnl_pts = round((live_p - t["entry"]) if t["signal"] == "LONG" else (t["entry"] - live_p), 2)
         lines += [
             "━━━━━━━━━━━━━━━━━━",
             f"🔥 <b>OCHIQ BITIM: {t['signal']} [{t.get('grade', 'A')}]</b> (<code>{pnl_pts:+.2f}$</code>)",
@@ -1691,18 +1777,18 @@ async def build_status_text():
             f"TP1: <code>{t['tp1']}</code> | TP2: <code>{t['tp2']}</code> | TP3: <code>{t.get('tp3', '-')}</code>",
         ]
     else:
-        lines += ["━━━━━━━━━━━━━━━━━━", "🔍 <i>Ochiq bitim yo'q — 15m POI + 5m LTF trigger kutilmoqda.</i>"]
+        lines += ["━━━━━━━━━━━━━━━━━━", "🔍 <i>Ochiq bitim yo'q — 15m POI + 5m Sniper trigger kutilmoqda.</i>"]
     lines.append(f"📊 {html.escape(await win_rate_text())}")
     return "\n".join(lines)
 
 async def build_zones_text():
-    cached = _zones_cache.get("XAU_15m")
+    zones_list = get_active_zones(_LAST_CANDLES_15M, "XAU_15m") if _LAST_CANDLES_15M else []
     s = await db.state_get("last_status", {})
-    price = s.get("price")
-    if not cached or not cached.get("zones") or not price:
+    price = _LIVE_PRICE or s.get("price")
+    if not zones_list or not price:
         return "🎯 Hozircha 15m da faol FVG / OB / Breaker zonalari topilmadi."
-    zones = sorted(cached["zones"], key=lambda z: abs(price - z["ce"]))[:7]
-    lines = [f"🎯 <b>Eng yaqin 15m SMC Zonalar (Narx: {price}):</b>"]
+    zones = sorted(zones_list, key=lambda z: abs(price - z["ce"]))[:7]
+    lines = [f"🎯 <b>Eng yaqin XM 15m SMC Zonalar (Narx: {price:.2f}):</b>"]
     for z in zones:
         icon = "🟢" if z["type"] == "bullish" else "🔴"
         dist = round(abs(price - z["ce"]), 2)
@@ -1723,6 +1809,39 @@ async def build_news_text(session):
         dt_str = e["time"].strftime("%d-%b %H:%M")
         lines.append(f"🔴 <code>{dt_str}</code> — {html.escape(e['title'])}")
     return "\n".join(lines)
+
+async def build_ai_market_analysis(session, custom_question=None):
+    if not GEMINI_API_KEY:
+        return (
+            "🧠 <b>Gemini AI hali yoqilmagan!</b>\n\n"
+            "Uni yoqish uchun Google AI Studio (aistudio.google.com) dan bepul API key olib, "
+            "Railway <b>Variables</b> bo'limiga qo'shing:\n"
+            "<code>GEMINI_API_KEY = sizning_kalitingiz</code>"
+        )
+    s = await db.state_get("last_status", {})
+    zones_txt = await build_zones_text()
+    sys_prompt = (
+        "Sen XM brokerda 20$ balans (0.01 lot) bilan ishlovchi treyderning shaxsiy SMC va ICT "
+        "yordamchisisan (Gemini AI). O'zbek tilida qisqa, aniq va tushunarli tahlil ber: "
+        "1) Hozirgi struktura va likvidlik qayerda? "
+        "2) Qaysi narxdan LONG yoki SHORT poylash kerak (Sniper zona)? "
+        "3) 20$ balans uchun xavfsizlik maslahati."
+    )
+    context = (
+        f"Joriy XM Narx: {_LIVE_PRICE or s.get('price')}\n"
+        f"5m bias: {s.get('b5')} | 15m bias: {s.get('b15')} ({s.get('event15')})\n"
+        f"1H: {s.get('b1h')} | 4H: {s.get('b4h')} | 1D: {s.get('b1d')}\n"
+        f"15m EQ (50%): {s.get('eq15')} | OTE: {s.get('ote_bottom')}-{s.get('ote_top')}\n"
+        f"PDH/PDL: {s.get('pdh')}/{s.get('pdl')} | Asia H/L: {s.get('asia_high')}/{s.get('asia_low')}\n"
+        f"EQH/EQL: {s.get('eqh')}/{s.get('eql')}\n"
+        f"Zonalar:\n{zones_txt}\n"
+    )
+    if custom_question:
+        context += f"\nFoydalanuvchi savoli: {custom_question}"
+    res = await ask_gemini_ai(session, context, system_instruction=sys_prompt)
+    if not res:
+        return "⚠️ Gemini AI bilan bog'lanishda vaqtinchalik xatolik yuz berdi."
+    return f"🧠 <b>Gemini AI SMC/ICT Tahlili:</b>\n\n{html.escape(res)}"
 
 async def telegram_listener(app):
     session = app["session"]
@@ -1750,6 +1869,7 @@ async def telegram_listener(app):
             await asyncio.sleep(5)
 
 async def _handle_update(app, upd):
+    global _CURRENT_OFFSET, _LIVE_PRICE
     session = app["session"]
     msg = upd.get("message", {})
     text = (msg.get("text") or "").strip()
@@ -1764,13 +1884,14 @@ async def _handle_update(app, upd):
         if not was:
             await send_telegram(
                 session,
-                "✅ <b>GOLD SMC v13 INSTITUTIONAL ULTRA botiga obuna bo'ldingiz!</b>\n\n"
-                "/signal — Joriy holat va chuqur MTF tahlil\n"
-                "/chart — Jonli 15m SMC Grafik chizmasi (PNG)\n"
-                "/zones — Faol FVG, OB va Breaker zonalar\n"
-                "/news — Muhim USD yangiliklar\n"
-                "/stats — Savdo statistikasi\n"
-                "/stop — Obunani bekor qilish",
+                "✅ <b>XM GOLD SMC v14 TITANIUM (Real-Time + AI + 20$ Sniper)</b>\n\n"
+                "📊 /signal — Jonli holat va MTF tahlil\n"
+                "🖼 /chart — 15m SMC Grafik chizmasi (PNG)\n"
+                "🧠 /ai — Gemini AI bozor tahlili\n"
+                "🎯 /zones — Faol FVG, OB va Breaker zonalar\n"
+                "🔄 /sync <code>4167.85</code> — XM narxini 1 soniyada sinxronlash\n"
+                "💵 /balance <code>20</code> — Balansni o'rnatish\n"
+                "📈 /stats — Savdo statistikasi",
                 with_keyboard=True, chat_id=cid,
             )
         else:
@@ -1782,15 +1903,16 @@ async def _handle_update(app, upd):
         await send_telegram(session, await build_status_text(), with_keyboard=True, chat_id=cid)
     elif text in ("/chart", "🖼 Grafik"):
         if not _LAST_CANDLES_15M:
-            await send_telegram(session, "⏳ Grafik ma'lumotlari yuklanmoqda, 5 soniyadan so'ng qayta bosing.", chat_id=cid)
+            await send_telegram(session, "⏳ Grafik yuklanmoqda, 3 soniyadan so'ng bosing.", chat_id=cid)
             return
         t = await db.state_get("current_trade")
         zones = get_active_zones(_LAST_CANDLES_15M, "XAU_15m")
         png = render_smc_chart_png(_LAST_CANDLES_15M, zones, _LAST_STRUCT_15M, trade=t)
         s = await db.state_get("last_status", {})
+        p_now = _LIVE_PRICE or s.get("price")
         cap = (
-            f"🖼 <b>{SYMBOL} 15m SMC/ICT Grafik</b>\n"
-            f"Narx: <code>{s.get('price')}</code> | 15m Bias: <b>{(s.get('b15') or '-').upper()}</b> | "
+            f"🖼 <b>XM GOLD 15m SMC/ICT Grafik</b>\n"
+            f"Narx: <code>{p_now}</code> | 15m Bias: <b>{(s.get('b15') or '-').upper()}</b> | "
             f"EQ: <code>{s.get('eq15') or '-'}</code>"
         )
         await send_telegram_photo(session, png, caption=cap, chat_id=cid)
@@ -1800,6 +1922,57 @@ async def _handle_update(app, upd):
         await send_telegram(session, await build_news_text(session), with_keyboard=True, chat_id=cid)
     elif text in ("/stats", "📈 Statistika"):
         await send_telegram(session, f"📊 <b>{html.escape(await win_rate_text())}</b>", with_keyboard=True, chat_id=cid)
+    elif text == "🧠 AI Tahlil" or text == "/ai" or text.startswith("/ai "):
+        q = text[3:].strip() if text.startswith("/ai") else None
+        await send_telegram(session, "🧠 <i>Gemini AI bozorni tahlil qilmoqda...</i>", chat_id=cid)
+        ans = await build_ai_market_analysis(session, custom_question=q)
+        await send_telegram(session, ans, with_keyboard=True, chat_id=cid)
+    elif text.startswith("/sync") and is_admin:
+        parts = text.split()
+        if len(parts) != 2 or not _LIVE_BYBIT_RAW_PRICE:
+            await send_telegram(
+                session,
+                "🔄 <b>XM narxini sinxronlash:</b>\n"
+                "XM MT5 dagi joriy GOLD narxini yozing. Masalan:\n"
+                "<code>/sync 4167.85</code>",
+                chat_id=cid,
+            )
+            return
+        try:
+            xm_p = float(parts[1].replace(",", "."))
+            new_off = round(xm_p - _LIVE_BYBIT_RAW_PRICE, 2)
+            _CURRENT_OFFSET = new_off
+            _LIVE_PRICE = round(_LIVE_BYBIT_RAW_PRICE + _CURRENT_OFFSET, 2)
+            await db.state_set("price_offset", _CURRENT_OFFSET)
+            clear_analysis_caches()
+            await send_telegram(
+                session,
+                f"✅ <b>XM bilan 100% sinxronlandi!</b>\n"
+                f"Yangi PRICE_OFFSET: <code>{_CURRENT_OFFSET:+.2f}$</code>\n"
+                f"Joriy bot narxi: <code>{_LIVE_PRICE:.2f}</code>",
+                chat_id=cid,
+            )
+        except ValueError:
+            await send_telegram(session, "Noto'g'ri format. Misol: <code>/sync 4167.85</code>", chat_id=cid)
+    elif text.startswith("/offset") and is_admin:
+        parts = text.split()
+        if len(parts) != 2:
+            await send_telegram(
+                session,
+                f"Joriy offset: <code>{_CURRENT_OFFSET:+.2f}$</code>\n"
+                f"O'zgartirish: <code>/offset -8.21</code>",
+                chat_id=cid,
+            )
+            return
+        try:
+            _CURRENT_OFFSET = round(float(parts[1].replace(",", ".")), 2)
+            if _LIVE_BYBIT_RAW_PRICE:
+                _LIVE_PRICE = round(_LIVE_BYBIT_RAW_PRICE + _CURRENT_OFFSET, 2)
+            await db.state_set("price_offset", _CURRENT_OFFSET)
+            clear_analysis_caches()
+            await send_telegram(session, f"✅ Offset <code>{_CURRENT_OFFSET:+.2f}$</code> saqlandi.", chat_id=cid)
+        except ValueError:
+            await send_telegram(session, "Misol: <code>/offset -8.21</code>", chat_id=cid)
     elif text == "/pause" and is_admin:
         await db.state_set("paused", True)
         await send_telegram(session, "⏸ Bot pauzaga qo'yildi.", chat_id=cid)
@@ -1809,7 +1982,7 @@ async def _handle_update(app, upd):
     elif text == "/close" and is_admin:
         t = await db.state_get("current_trade")
         st = await db.state_get("last_status", {})
-        p = st.get("price")
+        p = _LIVE_PRICE or st.get("price")
         if t and p:
             await close_trade(session, t, "MANUAL", p)
         else:
@@ -1817,7 +1990,7 @@ async def _handle_update(app, upd):
     elif text.startswith("/balance") and is_admin:
         parts = text.split()
         if len(parts) != 2:
-            await send_telegram(session, "Foydalanish: <code>/balance 1000</code>", chat_id=cid)
+            await send_telegram(session, "Foydalanish: <code>/balance 20</code>", chat_id=cid)
             return
         try:
             nb = float(parts[1].replace(",", "."))
@@ -1826,11 +1999,11 @@ async def _handle_update(app, upd):
             await update_account(balance=nb)
             await send_telegram(session, f"✅ Balans <b>{nb:.2f}$</b> saqlandi.", chat_id=cid)
         except ValueError:
-            await send_telegram(session, "Noto'g'ri qiymat. Misol: <code>/balance 1000</code>", chat_id=cid)
+            await send_telegram(session, "Noto'g'ri qiymat. Misol: <code>/balance 20</code>", chat_id=cid)
     elif text.startswith("/risk") and is_admin:
         parts = text.split()
         if len(parts) != 2:
-            await send_telegram(session, f"Foydalanish: <code>/risk 1</code> (maks {MAX_RISK_PER_TRADE_PCT}%)", chat_id=cid)
+            await send_telegram(session, f"Foydalanish: <code>/risk 10</code> (maks {MAX_RISK_PER_TRADE_PCT}%)", chat_id=cid)
             return
         try:
             nr = float(parts[1].replace(",", "."))
@@ -1850,8 +2023,9 @@ async def home(request):
     t = await db.state_get("current_trade")
     paused = await db.state_get("paused", False)
     acc = await get_account()
-    price = s.get("price")
+    price = _LIVE_PRICE or s.get("price")
     price_disp = f"${price:,.2f}" if price else "---"
+    ws_txt = "⚡ WS Real-Time" if _WS_CONNECTED else "🔄 REST"
 
     trade_html = "Ochiq bitim yo'q"
     if t:
@@ -1863,25 +2037,25 @@ async def home(request):
     html_page = f"""<!doctype html>
 <html lang="uz"><head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="5">
+<meta http-equiv="refresh" content="2">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gold SMC v13 ULTRA</title>
+<title>XM Gold SMC v14 TITANIUM</title>
 <style>
-  body {{ background:#0E1015; color:#EDE3CF; font-family: monospace; padding:20px; margin:0; }}
-  .card {{ background:#161922; border:1px solid #2E3446; border-radius:14px;
-           padding:22px; max-width:480px; margin:auto; box-shadow: 0 8px 24px rgba(0,0,0,0.6); }}
-  h2 {{ font-size:2.2em; margin:4px 0 6px; color:#E4C047; }}
+  body {{ background:#0B0D12; color:#EDE3CF; font-family: monospace; padding:20px; margin:0; }}
+  .card {{ background:#141821; border:1px solid #2A3142; border-radius:14px;
+           padding:22px; max-width:480px; margin:auto; box-shadow: 0 8px 24px rgba(0,0,0,0.65); }}
+  h2 {{ font-size:2.3em; margin:4px 0 6px; color:#E4C047; }}
   .tag {{ display:inline-block; padding:4px 10px; border-radius:8px;
-          background:#232836; margin:4px 4px 4px 0; font-size:0.85em; }}
-  hr {{ border:none; border-top:1px dashed #2E3446; margin:16px 0; }}
+          background:#212736; margin:4px 4px 4px 0; font-size:0.85em; }}
+  hr {{ border:none; border-top:1px dashed #2A3142; margin:16px 0; }}
   .muted {{ color:#949BA6; font-size:0.85em; }}
   .gold {{ color:#E4C047; font-weight:bold; }}
 </style>
 </head><body>
   <div class="card">
-    <div class="muted">GOLD (XAUUSDT) — SMC v13 INSTITUTIONAL ULTRA</div>
+    <div class="muted">XM GOLD — SMC v14 TITANIUM ({ws_txt})</div>
     <h2>{price_disp}</h2>
-    <div class="muted">Yangilangan: {s.get('time', '---')} | Sessiya: {current_session()}</div>
+    <div class="muted">Offset: {_CURRENT_OFFSET:+.2f}$ | Sessiya: {current_session()}</div>
     <div style="margin-top:12px">
       <span class="tag">{'⏸ Pauza' if paused else '🟢 Faol'}</span>
       <span class="tag">5m: {s.get('b5', '-')}</span>
@@ -1896,7 +2070,7 @@ async def home(request):
     <h3>Joriy Bitim</h3>
     <div>{trade_html}</div>
     <hr>
-    <div class="muted">Balans: ${acc.get('balance') or 0} | Risk: {acc.get('risk_pct')}%</div>
+    <div class="muted">Balans: ${acc.get('balance')} | Risk: {acc.get('risk_pct')}% | AI: {'Yoqilgan' if GEMINI_API_KEY else 'Ochiq'}</div>
     <div class="gold" style="margin-top:8px">{html.escape(await win_rate_text())}</div>
   </div>
 </body></html>"""
@@ -1906,12 +2080,14 @@ async def home(request):
 async def health(request):
     return web.json_response({
         "status": "ok",
-        "version": "v13_institutional_ultra",
+        "version": "v14_titanium_realtime_ai",
+        "ws_connected": _WS_CONNECTED,
+        "live_price": _LIVE_PRICE,
+        "price_offset": _CURRENT_OFFSET,
+        "ai_enabled": bool(GEMINI_API_KEY),
         "uptime": round(time.time() - _metrics["start"], 1),
         "paused": await db.state_get("paused", False),
         "has_open_trade": bool(await db.state_get("current_trade")),
-        "subscribers": len(await get_subs()),
-        "webhook_enabled": WEBHOOK_ENABLED,
         "metrics": _metrics,
     })
 
@@ -1922,8 +2098,8 @@ async def metrics(request):
         f"trades_closed_total {_metrics['closed']}",
         f"wins_total {_metrics['wins']}",
         f"losses_total {_metrics['losses']}",
+        f"ws_ticks_total {_metrics['ws_ticks']}",
         f"errors_total {_metrics['errors']}",
-        f"telegram_errors_total {_metrics['tg_errors']}",
         f"uptime_seconds {round(time.time() - _metrics['start'], 1)}",
     ]
     return web.Response(text="\n".join(lines), content_type="text/plain")
@@ -1993,18 +2169,20 @@ async def trading_loop(app):
 
 async def register_bot_commands(session):
     commands = [
-        {"command": "start", "description": "Obuna va menyu"},
-        {"command": "signal", "description": "Joriy holat va MTF tahlil"},
-        {"command": "chart", "description": "Jonli 15m SMC grafik (PNG)"},
+        {"command": "start", "description": "Menyu va holat"},
+        {"command": "signal", "description": "Jonli XM narx va MTF tahlil"},
+        {"command": "chart", "description": "15m SMC grafik chizmasi (PNG)"},
+        {"command": "ai", "description": "Gemini AI bozor tahlili"},
         {"command": "zones", "description": "Faol 15m FVG, OB va BB zonalar"},
+        {"command": "sync", "description": "XM narxiga sinxronlash (/sync 4167.85)"},
+        {"command": "offset", "description": "Narx farqini o'rnatish (/offset -8.21)"},
         {"command": "news", "description": "Muhim USD yangiliklar"},
         {"command": "stats", "description": "Win-rate va statistika"},
-        {"command": "stop", "description": "Obunani bekor qilish"},
+        {"command": "balance", "description": "Balans kiritish (/balance 20)"},
+        {"command": "risk", "description": "Risk % kiritish (/risk 10)"},
+        {"command": "close", "description": "Ochiq bitimni yopish (admin)"},
         {"command": "pause", "description": "Botni pauza qilish (admin)"},
         {"command": "resume", "description": "Botni yoqish (admin)"},
-        {"command": "close", "description": "Ochiq bitimni yopish (admin)"},
-        {"command": "balance", "description": "Balans kiritish (admin)"},
-        {"command": "risk", "description": "Risk % kiritish (admin)"},
     ]
     try:
         async with session.post(
@@ -2018,15 +2196,20 @@ async def register_bot_commands(session):
 
 # ==================== STARTUP / CLEANUP ====================
 async def startup_tasks(app):
+    global _CURRENT_OFFSET
     await db.init()
+    saved_offset = await db.state_get("price_offset")
+    if saved_offset is not None:
+        _CURRENT_OFFSET = float(saved_offset)
     app["session"] = aiohttp.ClientSession()
     await register_bot_commands(app["session"])
+    app["ws_task"] = asyncio.create_task(bybit_ws_loop(app), name="bybit_ws_loop")
     app["bot_task"] = asyncio.create_task(trading_loop(app), name="trading_loop")
     app["tg_task"] = asyncio.create_task(telegram_listener(app), name="tg_listener")
-    logger.info("✅ Bot ishga tushdi (v13 INSTITUTIONAL ULTRA)")
+    logger.info(f"✅ Bot ishga tushdi (v14 TITANIUM | Offset={_CURRENT_OFFSET:+.2f}$)")
 
 async def cleanup_tasks(app):
-    for key in ("bot_task", "tg_task"):
+    for key in ("ws_task", "bot_task", "tg_task"):
         t = app.get(key)
         if t:
             t.cancel()
