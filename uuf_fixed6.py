@@ -317,22 +317,23 @@ async def win_rate_text():
     wr = (wins / denom * 100) if denom > 0 else 0.0
     return f"WR: {wr:.1f}% ({wins}✅ / {losses}❌ / {be}🛡 | Jami: {total})"
 
-# ==================== GEMINI AI ENGINE (AUTO-MODEL + PRO FALLBACK) ====================
+# ==================== GEMINI AI ENGINE (FAST FREE-TIER + AUTO-CACHE) ====================
 _WORKING_GEMINI_MODEL = None
+_BLOCKED_GEMINI_MODELS = set()
+
 _GEMINI_MODEL_CANDIDATES = [
-    "gemini-2.5-pro",
-    "gemini-3.1-pro-preview",
-    "gemini-pro-latest",
-    "gemini-2.5-flash",
     "gemini-flash-latest",
-    "gemini-2.0-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash-preview-09-2025",
+    "gemini-pro-latest",
 ]
 
 async def _discover_available_gemini_model(session):
-    """Agar standart nomlar 404 bersa, API kalitda ochiq turgan eng kuchli modelni topadi."""
+    """Google serveridan kalit uchun ochiq va bloklanmagan modelni topadi."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GEMINI_API_KEY}"
     try:
-        async with session.get(url, timeout=10) as r:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
             if r.status != 200:
                 return None
             data = await r.json()
@@ -340,12 +341,17 @@ async def _discover_available_gemini_model(session):
             for m in data.get("models", []):
                 methods = m.get("supportedGenerationMethods", [])
                 name = m.get("name", "").replace("models/", "")
-                if "generateContent" in methods and "gemini" in name and "vision" not in name:
+                if (
+                    "generateContent" in methods
+                    and "gemini" in name
+                    and name not in _BLOCKED_GEMINI_MODELS
+                    and not any(x in name for x in ("vision", "tts", "image", "embedding", "aqa"))
+                ):
                     models.append(name)
-            # Avval 'pro', keyin 'flash' modellarni saralash
-            for pref in ("2.5-pro", "pro", "2.5-flash", "flash"):
+            # Bepul tarifda eng barqaror ishlaydigan flash modellarni birinchi tanlash
+            for pref in ("flash-latest", "flash-lite", "flash", "pro"):
                 for m_name in models:
-                    if pref in m_name and "tts" not in m_name and "image" not in m_name:
+                    if pref in m_name:
                         return m_name
             return models[0] if models else None
     except Exception:
@@ -356,53 +362,71 @@ async def ask_gemini_ai(session, prompt_text, system_instruction=None):
     if not GEMINI_API_KEY:
         return None
 
-    # Tekshiriladigan modellar ro'yxati
     candidates = []
-    if _WORKING_GEMINI_MODEL:
+    if _WORKING_GEMINI_MODEL and _WORKING_GEMINI_MODEL not in _BLOCKED_GEMINI_MODELS:
         candidates.append(_WORKING_GEMINI_MODEL)
-    env_model = os.environ.get("GEMINI_MODEL", "").strip().replace("models/", "")
-    if env_model and env_model not in candidates:
-        candidates.append(env_model)
+
     for m in _GEMINI_MODEL_CANDIDATES:
-        if m not in candidates:
+        if m not in candidates and m not in _BLOCKED_GEMINI_MODELS:
             candidates.append(m)
+
+    if not candidates:
+        discovered = await _discover_available_gemini_model(session)
+        if discovered:
+            candidates.append(discovered)
 
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        "generationConfig": {
+            "temperature": 0.25,
+            "maxOutputTokens": 800,
+        },
     }
     if system_instruction:
         payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
 
+    req_timeout = aiohttp.ClientTimeout(total=45, connect=10)
+
     for model_name in candidates:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
         try:
-            async with session.post(url, json=payload, timeout=25) as r:
-                if r.status == 404:
-                    logger.warning(f"Gemini model topilmadi (404): {model_name}, keyingisiga o'tilmoqda...")
+            async with session.post(url, json=payload, timeout=req_timeout) as r:
+                if r.status in (404, 403):
+                    _BLOCKED_GEMINI_MODELS.add(model_name)
+                    logger.warning(f"Gemini model o'chirildi ({r.status}): {model_name}")
+                    continue
+                if r.status == 429:
+                    err_txt = await r.text()
+                    # Agar kvota 0 bo'lsa (Free tierda yopiq model bo'lsa), qora ro'yxatga qo'shamiz
+                    if "quota" in err_txt.lower() or "billing" in err_txt.lower():
+                        _BLOCKED_GEMINI_MODELS.add(model_name)
+                    logger.warning(f"Gemini 429 kvota cheklovi ({model_name}), keyingisiga o'tilmoqda...")
                     continue
                 if r.status != 200:
                     err_txt = await r.text()
-                    logger.warning(f"Gemini API status {r.status} ({model_name}): {_safe_log_error(err_txt[:180])}")
+                    logger.warning(f"Gemini API status {r.status} ({model_name}): {_safe_log_error(err_txt[:160])}")
                     continue
+
                 data = await r.json()
                 cands = data.get("candidates", [])
                 if not cands:
                     continue
                 parts = cands[0].get("content", {}).get("parts", [])
                 text = "".join(p.get("text", "") for p in parts if not p.get("thought", False)).strip()
+                if not text and parts:
+                    text = "".join(p.get("text", "") for p in parts).strip()
                 if text:
                     if _WORKING_GEMINI_MODEL != model_name:
                         _WORKING_GEMINI_MODEL = model_name
-                        logger.info(f"🧠 Gemini AI faol model tanlandi: {model_name}")
+                        logger.info(f"🧠 Gemini AI faol model ulandi: {model_name}")
                     return text
         except Exception as e:
-            logger.warning(f"Gemini AI urinish xatosi ({model_name}): {_safe_log_error(e)}")
+            logger.warning(f"Gemini AI timeout/xato ({model_name}): {type(e).__name__} {_safe_log_error(e)}")
             continue
 
-    # Agar ro'yxatdagi hech biri topilmasa, Google serveridan ro'yxatni so'rab topish
+    # Oxirgi chora: serverdan yangi model nomini qidirib ko'rish
     discovered = await _discover_available_gemini_model(session)
-    if discovered and discovered not in candidates:
+    if discovered and discovered not in _BLOCKED_GEMINI_MODELS:
         _WORKING_GEMINI_MODEL = discovered
         return await ask_gemini_ai(session, prompt_text, system_instruction)
 
