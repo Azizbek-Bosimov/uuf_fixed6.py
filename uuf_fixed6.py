@@ -1645,10 +1645,11 @@ def evaluate_institutional_score(
 # ==================== MAIN CYCLE ====================
 async def run_bot_cycle(session):
     global _LAST_CANDLES_15M, _LAST_STRUCT_15M, _LIVE_BYBIT_RAW_PRICE, _LIVE_PRICE
-    try:
-        c15, c5 = await asyncio.gather(
-            fetch_ohlcv(session, "15m"),
-            fetch_ohlcv(session, "5m"),
+            try:
+            ai_comment = await generate_ai_signal_review(session, new_trade, status, confirmations)
+        except Exception:
+            ai_comment = None
+
         )
         htf = await fetch_htf_context(session)
         b1h, b4h, b1d = htf["b1h"], htf["b4h"], htf["b1d"]
